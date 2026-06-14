@@ -1,0 +1,23 @@
+# PyInstaller
+build/
+dist/
+*.spec.bak
+__pycache__/
+*.pyc
+*.pyo
+
+# App settings (user-specific)
+# Settings are stored in %APPDATA%\LTCtoLV1 — not in the repo
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+venv/
+.venv/
+.claude/settings.local.json
