@@ -321,7 +321,14 @@ class MainWindow:
         # Core objects
         self._tc_queue: "queue.Queue[Timecode]" = queue.Queue(maxsize=200)
         self._audio = AudioCapture(self._tc_queue)
-        self._lv1 = LV1Client(device_name="LTCtoLV1")
+        # Identify this client in the LV1's MyRemote ControlPanel by hostname
+        # so multiple machines running LTCtoLV1 are distinguishable.
+        import socket as _socket
+        try:
+            _hostname = _socket.gethostname() or "unknown"
+        except Exception:
+            _hostname = "unknown"
+        self._lv1 = LV1Client(device_name=f"LTC - {_hostname}")
         self._cue_list = CueList()
         self._engine = CueEngine(
             self._lv1,
