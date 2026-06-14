@@ -109,6 +109,18 @@ To build the standalone executables:
 - **macOS:** `bash build.sh` → `dist/LTCtoLV1.app` + `dist/LTCtoLV1.dmg`
   (requires `brew install create-dmg`)
 
+### Cutting a release
+
+The release scripts bump the version in `main_window.py`, commit/push/tag,
+build the binary for the current platform, and create / update the
+GitHub release with the binary attached. They're idempotent — safe to
+re-run, and either script can run first on its respective platform.
+
+- **Windows:** `release.bat 1.0.1` → uploads `LTCtoLV1.exe`
+- **macOS:** `bash release.sh 1.0.1` → uploads `LTCtoLV1.dmg`
+
+Requires the `gh` CLI authenticated against `miglourenco/ltctolv1`.
+
 ---
 
 ## License
