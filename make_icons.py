@@ -26,15 +26,19 @@ top = (h - side) // 2
 img = img.crop((left, top, left + side, top + side))
 
 # ── Windows .ico ──────────────────────────────────────────────────────────────
-ico_sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
-frames = [img.resize(s, Image.LANCZOS) for s in ico_sizes]
-frames[0].save(
+# Pillow's save(format='ICO', sizes=...) used to embed multiple sizes but in
+# recent versions only the FIRST size lands in the file, leaving Windows with
+# only the 16x16 image (which makes the taskbar fall back to a generic icon).
+# Work-around: hand the 256x256 image to PIL and tell it via `sizes=` which
+# additional resolutions to derive — Pillow then embeds all of them.
+ico_sizes = [(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)]
+biggest = img.resize(ico_sizes[0], Image.LANCZOS)
+biggest.save(
     "ltctolv1.ico",
     format="ICO",
     sizes=ico_sizes,
-    append_images=frames[1:],
 )
-print("Created ltctolv1.ico")
+print(f"Created ltctolv1.ico  ({len(ico_sizes)} resolutions)")
 
 # ── macOS iconset (run  iconutil -c icns ltctolv1.iconset  on a Mac) ──────────
 iconset = Path("ltctolv1.iconset")
