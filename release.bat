@@ -1,14 +1,14 @@
 @echo off
-REM ─────────────────────────────────────────────────────────────────────────
-REM  release.bat — bump + commit + tag + build + GitHub release
+REM -------------------------------------------------------------------------
+REM  release.bat -- bump + commit + tag + build + GitHub release
 REM
 REM  Usage:   release.bat 1.0.1
 REM
 REM  Idempotent: safe to re-run. Skips steps that are already done. Builds
 REM  the Windows .exe and uploads it to the GitHub release for that tag.
-REM  Run release.sh on a Mac afterwards (or first — order doesn't matter)
+REM  Run release.sh on a Mac afterwards (or first -- order does not matter)
 REM  to also build + attach the .dmg.
-REM ─────────────────────────────────────────────────────────────────────────
+REM -------------------------------------------------------------------------
 
 setlocal
 
@@ -31,9 +31,13 @@ python -c "import re,sys; p='main_window.py'; s=open(p,encoding='utf-8').read();
 if errorlevel 1 exit /b 1
 
 echo === [3/6] Building dist\LTCtoLV1.exe ===
-call build.bat
+python -m pip install --upgrade pyinstaller pillow >NUL
+if not exist ltctolv1.ico (
+    python make_icons.py
+)
+python -m PyInstaller --clean --noconfirm ltctolv1.spec
 if errorlevel 1 (
-    echo ERROR: build failed.
+    echo ERROR: PyInstaller build failed.
     exit /b 1
 )
 if not exist dist\LTCtoLV1.exe (
@@ -68,13 +72,13 @@ if errorlevel 1 (
     echo   creating release v%VERSION%
     gh release create v%VERSION% --repo miglourenco/ltctolv1 --title "v%VERSION%" --generate-notes dist\LTCtoLV1.exe
 ) else (
-    echo   release v%VERSION% exists — uploading LTCtoLV1.exe as asset (overwriting)
+    echo   release v%VERSION% exists -- uploading LTCtoLV1.exe as asset (overwriting)
     gh release upload v%VERSION% dist\LTCtoLV1.exe --repo miglourenco/ltctolv1 --clobber
 )
 
 echo.
-echo ─────────────────────────────────────────────────────────────
+echo -------------------------------------------------------------
 echo  Release v%VERSION% published.
 echo  https://github.com/miglourenco/ltctolv1/releases/tag/v%VERSION%
-echo ─────────────────────────────────────────────────────────────
+echo -------------------------------------------------------------
 endlocal
