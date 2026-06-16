@@ -1077,8 +1077,7 @@ class MainWindow:
     def _tap(self) -> None:
         if self._current_tc is None:
             return
-        tc_str = f"{self._current_tc.h:02d}:{self._current_tc.m:02d}:" \
-                 f"{self._current_tc.s:02d}:{self._current_tc.f:02d}"
+        tc_str = str(self._current_tc)
         new = self._cue_list.add(
             label=f"Cue {len(self._cue_list) + 1}",
             timecode=tc_str,
@@ -1205,9 +1204,7 @@ class MainWindow:
 
             if latest is not None:
                 self._current_tc = latest
-                self._tc_label.config(
-                    text=f"{latest.h:02d}:{latest.m:02d}:{latest.s:02d}:{latest.f:02d}"
-                )
+                self._tc_label.config(text=str(latest))
                 self._last_tc_time = 0
                 fps = self._audio.detected_fps
                 if fps:
