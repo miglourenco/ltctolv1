@@ -359,10 +359,12 @@ class MainWindow:
 
         # UI state
         self._running = False
-        self._recovering = False
+        self._recovering = False   # True while waiting to auto-restart after stream death
+        self._last_signal_ok: Optional[bool] = None  # tri-state: None, True, False
         self._current_tc: Optional[Timecode] = None
         self._current_file: Optional[str] = None
         self._flash_after: Optional[str] = None
+        # Frames-since-last-TC counter. The poll loop ticks every 40 ms.
         self._last_tc_time: int = 0
         self._audio_devices: List = []
         self._detected_sr: int = settings.sample_rate
@@ -571,9 +573,15 @@ class MainWindow:
         self._tc_label = tk.Label(tcf, text="00:00:00:00", bg=_BG_TC, fg=_TC_OFF,
                                   font=_F_TC)
         self._tc_label.pack()
-        self._fps_label = tk.Label(tcf, text="-- fps", bg=_BG_TC, fg=_FG_DIM,
+        # Status row: signal indicator + FPS, side-by-side under the TC display
+        row = tk.Frame(tcf, bg=_BG_TC)
+        row.pack(fill="x")
+        self._ltc_status = tk.Label(row, text="● Stopped", bg=_BG_TC, fg=_FG_DIM,
+                                    font=_F_UI)
+        self._ltc_status.pack(side="left")
+        self._fps_label = tk.Label(row, text="-- fps", bg=_BG_TC, fg=_FG_DIM,
                                    font=_F_FPS)
-        self._fps_label.pack()
+        self._fps_label.pack(side="right")
 
         # Right: LV1 status + current scene
         sf = tk.Frame(wrap, bg=_BG_PAN, padx=12, pady=8,
@@ -1138,6 +1146,10 @@ class MainWindow:
             messagebox.showerror("Audio", f"Failed to start audio:\n{exc}")
             return
         self._running = True
+        self._recovering = False
+        self._last_signal_ok = None
+        self._last_tc_time = 0
+        self._ltc_status.config(text="● Waiting for LTC signal…", fg=_FG_WARN)
         self._start_btn.config(state="disabled")
         self._stop_btn.configure(bg=_ST_BG, fg="#FFFFFF")
         self._stop_btn.config(state="normal")
@@ -1152,6 +1164,9 @@ class MainWindow:
         except Exception:
             pass
         self._running = False
+        self._recovering = False
+        self._last_signal_ok = None
+        self._ltc_status.config(text="● Stopped", fg=_FG_DIM)
         self._start_btn.config(state="normal")
         self._stop_btn.configure(bg=_ST_DIS, fg="#555555")
         self._stop_btn.config(state="disabled")
@@ -1160,32 +1175,72 @@ class MainWindow:
     # === Timecode polling ===================================================
 
     def _poll_queue(self) -> None:
-        try:
-            while True:
-                tc = self._tc_queue.get_nowait()
-                self._current_tc = tc
-                self._tc_label.config(
-                    text=f"{tc.h:02d}:{tc.m:02d}:{tc.s:02d}:{tc.f:02d}",
-                    fg=_TC_ON,
-                )
-                fps_disp = (
-                    f"{tc.fps:.2f} fps".rstrip("0").rstrip(".")
-                    if tc.fps else "-- fps"
-                )
-                self._fps_label.config(text=fps_disp, fg=_FG_HEAD)
-                self._engine.on_timecode(tc)
-                import time as _t
-                self._last_tc_time = int(_t.monotonic() * 1000)
-        except queue.Empty:
-            pass
-
-        # Fade the TC display if no signal for >300 ms
-        if self._last_tc_time > 0:
-            import time as _t
-            if int(_t.monotonic() * 1000) - self._last_tc_time > 300:
+        """Main thread, ~25 Hz. Drains the timecode queue into the cue engine,
+        updates the TC display, and polls the audio capture for signal status
+        and stream health (driver reset auto-recovery)."""
+        if self._running and not self._recovering:
+            # Detect unexpected stream death (e.g. SoundGrid driver reset, ASIO
+            # silent hang). Reset and try again in 2 s.
+            if not self._audio.stream_active or self._audio.callback_stalled:
+                self._recovering = True
+                self._last_signal_ok = None
+                self._audio.stop()
+                self._ltc_status.config(text="● Driver reset — restarting…", fg=_FG_WARN)
                 self._tc_label.config(fg=_TC_OFF)
+                self.root.after(2000, self._auto_restart)
+                self.root.after(40, self._poll_queue)
+                return
 
-        self.root.after(30, self._poll_queue)
+            latest: Optional[Timecode] = None
+            try:
+                while True:
+                    tc = self._tc_queue.get_nowait()
+                    self._engine.on_timecode(tc)
+                    self._engine.set_fps(tc.fps)
+                    latest = tc
+            except queue.Empty:
+                pass
+
+            if latest is not None:
+                self._current_tc = latest
+                self._tc_label.config(
+                    text=f"{latest.h:02d}:{latest.m:02d}:{latest.s:02d}:{latest.f:02d}"
+                )
+                self._last_tc_time = 0
+                fps = self._audio.detected_fps
+                if fps:
+                    self._fps_label.config(text=f"{fps:.2f} fps".rstrip("0").rstrip("."),
+                                            fg=_FG_HEAD)
+
+            self._last_tc_time += 1
+            signal_ok = self._audio.signal_present
+            no_signal_timeout = not signal_ok and self._last_tc_time > 25
+            # Only call .config() when state actually changes
+            if signal_ok and self._last_signal_ok is not True:
+                self._last_signal_ok = True
+                self._ltc_status.config(text="● LTC OK", fg=_FG_OK)
+                self._tc_label.config(fg=_TC_ON)
+            elif no_signal_timeout and self._last_signal_ok is not False:
+                self._last_signal_ok = False
+                self._tc_label.config(fg=_TC_OFF)
+                self._ltc_status.config(text="● No signal", fg=_FG_ERR)
+
+        self.root.after(40, self._poll_queue)   # 40 ms ≈ 25 Hz
+
+    def _auto_restart(self) -> None:
+        """Re-arm the audio capture after a detected driver reset."""
+        if not self._running:
+            self._recovering = False
+            return
+        try:
+            self._audio.start()
+            self._recovering = False
+            self._ltc_status.config(text="● Restarted — waiting for signal",
+                                    fg=_FG_WARN)
+        except Exception as exc:  # noqa: BLE001
+            # Try again in 2 s — driver may still be busy
+            self._ltc_status.config(text=f"● Restart failed: {exc}", fg=_FG_ERR)
+            self.root.after(2000, self._auto_restart)
 
     # === Engine callbacks ===================================================
 
