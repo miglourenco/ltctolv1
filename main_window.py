@@ -360,7 +360,9 @@ class MainWindow:
         # UI state
         self._running = False
         self._recovering = False   # True while waiting to auto-restart after stream death
-        self._last_signal_ok: Optional[bool] = None  # tri-state: None, True, False
+        # Tracks the LTC status label state so we only re-paint on change.
+        # Values: None | "LOCKED" | "AUDIO_NOT_LTC" | "NO_SIGNAL"
+        self._last_signal_ok: Optional[str] = None
         self._current_tc: Optional[Timecode] = None
         self._current_file: Optional[str] = None
         self._flash_after: Optional[str] = None
@@ -1213,17 +1215,36 @@ class MainWindow:
                                             fg=_FG_HEAD)
 
             self._last_tc_time += 1
+            # Three distinct states for the LTC pipeline:
+            #   - locked         → decoder is producing frames (true "LTC OK")
+            #   - signal present → audio above noise floor BUT no LTC pattern
+            #                       (wrong channel, wrong sample rate, garbage)
+            #   - no signal      → audio input silent for >1 s
+            locked = self._audio.is_locked
             signal_ok = self._audio.signal_present
-            no_signal_timeout = not signal_ok and self._last_tc_time > 25
-            # Only call .config() when state actually changes
-            if signal_ok and self._last_signal_ok is not True:
-                self._last_signal_ok = True
-                self._ltc_status.config(text="● LTC OK", fg=_FG_OK)
-                self._tc_label.config(fg=_TC_ON)
-            elif no_signal_timeout and self._last_signal_ok is not False:
-                self._last_signal_ok = False
-                self._tc_label.config(fg=_TC_OFF)
-                self._ltc_status.config(text="● No signal", fg=_FG_ERR)
+            if locked:
+                new_state = "LOCKED"
+            elif signal_ok:
+                new_state = "AUDIO_NOT_LTC"
+            elif self._last_tc_time > 25:
+                new_state = "NO_SIGNAL"
+            else:
+                new_state = None  # still in waiting-for-first-frame grace period
+
+            if new_state and new_state != self._last_signal_ok:
+                self._last_signal_ok = new_state
+                if new_state == "LOCKED":
+                    self._ltc_status.config(text="● LTC OK", fg=_FG_OK)
+                    self._tc_label.config(fg=_TC_ON)
+                elif new_state == "AUDIO_NOT_LTC":
+                    self._ltc_status.config(
+                        text="● Audio present but no LTC (wrong channel / SR?)",
+                        fg=_FG_WARN,
+                    )
+                    self._tc_label.config(fg=_TC_OFF)
+                else:  # NO_SIGNAL
+                    self._tc_label.config(fg=_TC_OFF)
+                    self._ltc_status.config(text="● No signal", fg=_FG_ERR)
 
         self.root.after(40, self._poll_queue)   # 40 ms ≈ 25 Hz
 
