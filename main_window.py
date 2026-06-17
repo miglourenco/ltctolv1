@@ -666,6 +666,14 @@ class MainWindow:
         hdr.pack(fill="x")
         tk.Label(hdr, text="LV1 SCENES", bg=_BG_HDR, fg=_FG_HEAD,
                  font=_F_UIB, padx=8, pady=3).pack(side="left")
+        # Inline hint so the gestures are discoverable
+        hint_font = (
+            ("Segoe UI", 8, "italic") if sys.platform == "win32"
+            else ("Helvetica Neue", 10, "italic")
+        )
+        tk.Label(hdr, text="double-click → recall   ·   drag onto a cue → assign",
+                 bg=_BG_HDR, fg=_FG_DIM, font=hint_font,
+                 padx=8, pady=3).pack(side="right")
 
         body = tk.Frame(wrap, bg=_BG_PAN, padx=4, pady=4,
                         highlightthickness=1, highlightbackground=_BORDER)
