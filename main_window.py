@@ -706,6 +706,10 @@ class MainWindow:
         sp = ttk.Spinbox(ftr, from_=0, to=10, width=4, textvariable=self._tol_var,
                          command=self._update_tolerance)
         sp.pack(side="left", padx=(4, 12))
+        # ttk.Spinbox' `command=` only fires when the user clicks the arrows;
+        # direct typing into the field is silent. Trace the StringVar so ANY
+        # change (arrows OR typing) gets reflected in the engine immediately.
+        self._tol_var.trace_add("write", lambda *_: self._update_tolerance())
         self._dry_var = tk.BooleanVar(value=self.settings.dry_run)
         ttk.Checkbutton(ftr, text="Dry-run (don't send OSC)",
                         variable=self._dry_var,
