@@ -1319,6 +1319,9 @@ class MainWindow:
         self._run_btn.configure(text="■  STOP", bg=_ST_BG, fg="#FFFFFF")
         self._run_btn._bg = _ST_BG
         self._run_btn._abg = _ST_ABG
+        # Lock audio controls — changing them mid-stream has no effect and
+        # would mislead the operator into thinking the new value is in use.
+        self._set_audio_controls_enabled(False)
         self.settings.audio_device = sel.split("  (")[0]
         self.settings.audio_channel = ch1
         self.settings.block_size = block_size
@@ -1339,6 +1342,22 @@ class MainWindow:
         self._run_btn._bg = _GO_BG
         self._run_btn._abg = _GO_ABG
         self._tc_label.config(fg=_TC_OFF)
+        # Unlock audio controls
+        self._set_audio_controls_enabled(True)
+
+    def _set_audio_controls_enabled(self, enabled: bool) -> None:
+        """Enable / disable all audio settings widgets. Called from start/stop
+        so the operator can't change inputs / SR / buffer mid-stream (those
+        only take effect on the next start anyway)."""
+        combo_state = "readonly" if enabled else "disabled"
+        self._audio_combo.configure(state=combo_state)
+        self._ch_combo.configure(state=combo_state)
+        self._block_combo.configure(state=combo_state)
+        # Sample-rate combo is special — it's only active when SR Force is on.
+        if enabled and self._sr_force_var.get():
+            self._sr_combo.configure(state="readonly")
+        else:
+            self._sr_combo.configure(state="disabled")
 
     # === Timecode polling ===================================================
 
