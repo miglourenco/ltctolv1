@@ -846,6 +846,10 @@ class MainWindow:
         if not target:
             return
         host, port = target
+        # Immediate feedback before the reader thread reports back.
+        self._set_lv1_button(online=True, label="● connecting…")
+        self._lv1_state_label.config(text=f"Connecting to {host}:{port}…",
+                                      fg=_FG_WARN)
         self._lv1.auto_reconnect = True
         self._lv1.connect(host, port)
         self.settings.lv1_host = self._lv1_host_var.get().strip()
@@ -864,6 +868,11 @@ class MainWindow:
                     break
 
     def _disconnect_lv1(self) -> None:
+        # Immediate visual feedback — disconnect() can take a moment to wind
+        # down the reader thread, so we don't want the button to look ONLINE
+        # while we're actually tearing the connection down.
+        self._set_lv1_button(online=False, label="● disconnecting…")
+        self._lv1_state_label.config(text="Disconnecting…", fg=_FG_WARN)
         self._lv1.auto_reconnect = False
         self._lv1.disconnect()
 
