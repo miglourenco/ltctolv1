@@ -537,31 +537,24 @@ class MainWindow:
                  bg=_BG_WID, fg=_FG, insertbackground=_FG,
                  highlightthickness=0).pack(side="left", padx=4)
 
-        # Right: transport + LV1 connect
+        # Right: single transport button (toggles START ↔ STOP) above the
+        # LV1 connect button, both right-aligned.
         tf = tk.Frame(body, bg=_BG_PAN, padx=8)
         tf.pack(side="right", fill="y", pady=2)
 
-        row1 = tk.Frame(tf, bg=_BG_PAN)
-        row1.pack(pady=(0, 4))
-        self._lv1_btn = _btn(row1, "Connect LV1", self._toggle_lv1,
-                             bg=_BTN_BG, abg=_BTN_ABG, fg=_FG,
-                             width=12, px=10, py=4,
-                             font=("Segoe UI", 9, "bold"))
-        self._lv1_btn.pack(side="left")
+        # Transport button on top — bigger and more visible.
+        self._run_btn = _btn(tf, "▶  START", self._toggle_run,
+                             bg=_GO_BG, abg=_GO_ABG, fg="#FFFFFF",
+                             width=14, px=12, py=6,
+                             font=("Segoe UI", 10, "bold"))
+        self._run_btn.pack(pady=(0, 4))
 
-        row2 = tk.Frame(tf, bg=_BG_PAN)
-        row2.pack()
-        self._start_btn = _btn(row2, "▶  START", self._start,
-                               bg=_GO_BG, abg=_GO_ABG, fg="#FFFFFF",
-                               width=10, px=10, py=4,
-                               font=("Segoe UI", 9, "bold"))
-        self._start_btn.pack(side="left", padx=2)
-        self._stop_btn = _btn(row2, "■  STOP", self._stop,
-                              bg=_ST_DIS, abg=_ST_ABG, fg="#555555",
-                              width=10, px=10, py=4,
-                              font=("Segoe UI", 9, "bold"))
-        self._stop_btn.pack(side="left", padx=2)
-        self._stop_btn.config(state="disabled")
+        # LV1 connect underneath.
+        self._lv1_btn = _btn(tf, "Connect LV1", self._toggle_lv1,
+                             bg=_BTN_BG, abg=_BTN_ABG, fg=_FG,
+                             width=14, px=12, py=4,
+                             font=("Segoe UI", 9, "bold"))
+        self._lv1_btn.pack()
 
     def _build_tc_panel(self, parent: tk.Frame) -> None:
         wrap = tk.Frame(parent, bg=_BG)
@@ -682,6 +675,8 @@ class MainWindow:
         sb = ttk.Scrollbar(body, orient="vertical", command=self._cat_tree.yview)
         sb.pack(side="right", fill="y")
         self._cat_tree.configure(yscrollcommand=sb.set)
+        # Double-click on a scene recalls it on the LV1 (single-click selects only).
+        self._cat_tree.bind("<Double-1>", self._on_catalog_double_click)
 
     def _build_footer(self, parent: tk.Frame) -> None:
         ftr = tk.Frame(parent, bg=_BG)
@@ -905,7 +900,23 @@ class MainWindow:
         for idx in sorted(self._scene_catalog):
             name = self._scene_catalog[idx]
             tags = ("current",) if idx == cur else ()
-            self._cat_tree.insert("", "end", values=(idx, name), tags=tags)
+            self._cat_tree.insert("", "end", iid=str(idx), values=(idx, name), tags=tags)
+
+    def _on_catalog_double_click(self, _e=None) -> None:
+        """Double-click on the LV1 scene catalog → recall that scene on the LV1."""
+        sel = self._cat_tree.selection()
+        if not sel:
+            return
+        try:
+            idx = int(sel[0])
+        except ValueError:
+            return
+        if not self._lv1.is_connected():
+            messagebox.showwarning("Not connected", "Connect to the LV1 first.")
+            return
+        name = self._scene_catalog.get(idx, "(unknown)")
+        self._lv1.recall_scene(idx)
+        self._set_status(f"Recalled scene [{idx}] {name}")
 
     def _show_validation_warnings(self) -> None:
         if not self._cue_list.cues:
@@ -1121,6 +1132,12 @@ class MainWindow:
 
     # === Audio start/stop ===================================================
 
+    def _toggle_run(self) -> None:
+        if self._running:
+            self._stop()
+        else:
+            self._start()
+
     def _start(self) -> None:
         if self._running:
             return
@@ -1146,14 +1163,20 @@ class MainWindow:
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Audio", f"Failed to start audio:\n{exc}")
             return
+
+        # Auto-connect the LV1 too, if a target is configured.
+        if not self._lv1.is_connected() and self._resolve_target(quiet=True) is not None:
+            self._connect_lv1()
+
         self._running = True
         self._recovering = False
         self._last_signal_ok = None
         self._last_tc_time = 0
         self._ltc_status.config(text="● Waiting for LTC signal…", fg=_FG_WARN)
-        self._start_btn.config(state="disabled")
-        self._stop_btn.configure(bg=_ST_BG, fg="#FFFFFF")
-        self._stop_btn.config(state="normal")
+        # Morph the transport button into STOP mode
+        self._run_btn.configure(text="■  STOP", bg=_ST_BG, fg="#FFFFFF")
+        self._run_btn._bg = _ST_BG
+        self._run_btn._abg = _ST_ABG
         self.settings.audio_device = sel.split("  (")[0]
         self.settings.audio_channel = ch1
 
@@ -1168,9 +1191,10 @@ class MainWindow:
         self._recovering = False
         self._last_signal_ok = None
         self._ltc_status.config(text="● Stopped", fg=_FG_DIM)
-        self._start_btn.config(state="normal")
-        self._stop_btn.configure(bg=_ST_DIS, fg="#555555")
-        self._stop_btn.config(state="disabled")
+        # Morph the transport button back into START mode
+        self._run_btn.configure(text="▶  START", bg=_GO_BG, fg="#FFFFFF")
+        self._run_btn._bg = _GO_BG
+        self._run_btn._abg = _GO_ABG
         self._tc_label.config(fg=_TC_OFF)
 
     # === Timecode polling ===================================================
@@ -1264,9 +1288,14 @@ class MainWindow:
 
     def _on_cue_fired(self, cue: Cue) -> None:
         self._refresh_tree()
+        # Diagnostic: log the LIVE TC at the moment of firing alongside the
+        # cue's target TC. If "fired at" lags the cue's target by more than a
+        # few frames, the firing pipeline is delayed (audio buffer / queue
+        # backlog / poll latency).
+        cur = str(self._current_tc) if self._current_tc else "??:??:??:??"
         self._set_status(
-            f"Fired: '{cue.label}' → scene {cue.scene_index} "
-            f"({cue.scene_name or 'unnamed'})"
+            f"Fired @ {cur}: '{cue.label}' target={cue.timecode} → "
+            f"scene {cue.scene_index} ({cue.scene_name or 'unnamed'})"
         )
 
     def _on_cue_skipped(self, cue: Cue, reason: str) -> None:
