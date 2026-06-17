@@ -874,7 +874,16 @@ class MainWindow:
         self._set_lv1_button(online=False, label="● disconnecting…")
         self._lv1_state_label.config(text="Disconnecting…", fg=_FG_WARN)
         self._lv1.auto_reconnect = False
-        self._lv1.disconnect()
+        # Run the actual disconnect on a worker thread. LV1Client.disconnect()
+        # calls reader.join(timeout=2.0), which would freeze the entire main
+        # thread (including the TC display poll loop) until the reader exits.
+        # The connection_change callback fires with connected=False once the
+        # reader finishes — that's what updates the button to "● OFFLINE".
+        threading.Thread(
+            target=self._lv1.disconnect,
+            name="LV1DisconnectWorker",
+            daemon=True,
+        ).start()
 
     # === LV1 callbacks (already marshalled to UI thread) ====================
 
