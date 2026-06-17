@@ -39,7 +39,7 @@ from zdns_discover import DiscoveryEntry, DiscoveryScanner
 
 # --- Constants --------------------------------------------------------------
 
-_VERSION = "1.0.4"
+_VERSION = "1.0.5"
 _GH_OWNER_REPO = "miglourenco/ltctolv1"
 _RELEASES_API = f"https://api.github.com/repos/{_GH_OWNER_REPO}/releases/latest"
 _RELEASES_URL = f"https://github.com/{_GH_OWNER_REPO}/releases"
