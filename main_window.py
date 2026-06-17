@@ -542,11 +542,11 @@ class MainWindow:
         tf = tk.Frame(body, bg=_BG_PAN, padx=8)
         tf.pack(side="right", fill="y", pady=2)
 
-        # Transport button on top — bigger and more visible.
+        # Transport button on top — same dimensions as the LV1 connect button.
         self._run_btn = _btn(tf, "▶  START", self._toggle_run,
                              bg=_GO_BG, abg=_GO_ABG, fg="#FFFFFF",
-                             width=14, px=12, py=6,
-                             font=("Segoe UI", 10, "bold"))
+                             width=14, px=12, py=4,
+                             font=("Segoe UI", 9, "bold"))
         self._run_btn.pack(pady=(0, 4))
 
         # LV1 connect underneath. Red = offline (default), green = online.
