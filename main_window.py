@@ -649,13 +649,13 @@ class MainWindow:
         # Buttons row
         br = tk.Frame(wrap, bg=_BG)
         br.pack(fill="x", pady=(4, 0))
-        _btn(br, "+ Add",       self._add_cue).pack(side="left", padx=2)
+        _btn(br, "Quick Add +", self._tap).pack(side="left", padx=2)
+        _btn(br, "+ Add",       self._add_cue).pack(side="left", padx=(12, 2))
         _btn(br, "Edit",        self._edit_cue).pack(side="left", padx=2)
         _btn(br, "Remove",      self._remove_cue).pack(side="left", padx=2)
         _btn(br, "▲",           self._move_up, width=2).pack(side="left", padx=2)
         _btn(br, "▼",           self._move_down, width=2).pack(side="left", padx=2)
-        _btn(br, "TAP",         self._tap).pack(side="left", padx=(12, 2))
-        _btn(br, "▶ Test",      self._test_fire).pack(side="left", padx=2)
+        _btn(br, "▶ Test",      self._test_fire).pack(side="left", padx=(12, 2))
         _btn(br, "↺ Reset",     self._reset_fired).pack(side="left", padx=2)
         _btn(br, "Re-validate", self._revalidate).pack(side="left", padx=(12, 2))
 
