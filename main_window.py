@@ -512,6 +512,16 @@ class MainWindow:
                                       values=["44100", "48000", "96000"],
                                       width=7, state="disabled")
         self._sr_combo.pack(side="left")
+        # Buffer size — affects callback latency. Smaller = lower latency
+        # but higher CPU. Take effect on next START.
+        tk.Label(ar, text="Buffer:", bg=_BG_PAN, fg=_FG_HEAD, font=_F_UI).pack(side="left", padx=(8, 2))
+        self._block_var = tk.StringVar(value=str(self.settings.block_size))
+        self._block_combo = ttk.Combobox(
+            ar, textvariable=self._block_var,
+            values=["64", "128", "256", "512", "1024", "2048"],
+            width=6, state="readonly", font=_F_UI,
+        )
+        self._block_combo.pack(side="left")
         _btn(ar, "↺", self._refresh_audio_devices, width=2, px=5, py=1).pack(side="left", padx=(6, 0))
         self._audio_combo.bind("<<ComboboxSelected>>", self._on_audio_device_changed)
 
@@ -1286,7 +1296,11 @@ class MainWindow:
             dev.get("default_samplerate", 48000)
         )
         try:
-            self._audio.configure(dev["index"], ch1 - 1, sr)
+            block_size = int(self._block_var.get())
+        except ValueError:
+            block_size = 512
+        try:
+            self._audio.configure(dev["index"], ch1 - 1, sr, block_size)
             self._audio.start()
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Audio", f"Failed to start audio:\n{exc}")
@@ -1307,6 +1321,7 @@ class MainWindow:
         self._run_btn._abg = _ST_ABG
         self.settings.audio_device = sel.split("  (")[0]
         self.settings.audio_channel = ch1
+        self.settings.block_size = block_size
 
     def _stop(self) -> None:
         if not self._running:

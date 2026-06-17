@@ -210,6 +210,7 @@ class AppSettings:
     audio_device: str = ""
     audio_channel: int = 1  # 1-based for UI; convert to 0-based when using
     sample_rate: int = 48000
+    block_size: int = 512  # PortAudio buffer size in samples
     # LV1 connection
     lv1_selected: str = ""  # encoded "ip:port" from the discovery dropdown
     lv1_host: str = ""  # manual override

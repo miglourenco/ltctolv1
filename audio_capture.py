@@ -113,19 +113,28 @@ class AudioCapture:
         self._device_index: Optional[int] = None
         self._channel: int = 0          # 0-based
         self._sample_rate: int = 48000
+        self._block_size: int = 512
         self._running: bool = False
         self._last_callback_time: float = 0.0
 
     # ── configuration ─────────────────────────────────────────────────────────
 
-    def configure(self, device_index: int, channel: int, sample_rate: int = 48000) -> None:
+    def configure(
+        self,
+        device_index: int,
+        channel: int,
+        sample_rate: int = 48000,
+        block_size: int = 512,
+    ) -> None:
         """
         Set capture parameters. Must be called before start().
         channel: 0-based index into the device's input channels.
+        block_size: PortAudio callback buffer size in samples.
         """
         self._device_index = device_index
         self._channel = channel
         self._sample_rate = sample_rate
+        self._block_size = block_size
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
@@ -153,12 +162,20 @@ class AudioCapture:
                     device=self._device_index,
                     channels=n_ch,
                     samplerate=self._sample_rate,
-                    blocksize=512,
+                    blocksize=self._block_size,
                     dtype="float32",
                     callback=self._audio_callback,
                     latency="low",
                 )
                 self._stream.start()
+                try:
+                    print(
+                        f"[audio] stream open: SR={int(self._stream.samplerate)}  "
+                        f"block={self._block_size}  "
+                        f"latency={float(self._stream.latency)*1000:.1f}ms"
+                    )
+                except Exception:
+                    pass
                 break  # success
             except sd.PortAudioError:
                 if attempt == 0:
