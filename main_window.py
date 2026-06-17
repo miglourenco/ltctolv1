@@ -421,10 +421,42 @@ class MainWindow:
                     bordercolor=_BORDER, lightcolor=_BG_WID, darkcolor=_BG_WID,
                     arrowcolor=_FG_HEAD, selectbackground=_BG_WID,
                     selectforeground=_FG, relief="flat")
-        s.map("TCombobox",
-              fieldbackground=[("readonly", _BG_WID)],
-              selectbackground=[("readonly", _BG_WID)],
-              selectforeground=[("readonly", _FG)])
+        # Combobox states: readonly = enabled (browse-only), disabled = locked.
+        # The disabled state gets a darker fill + dim text + dim arrow so it
+        # reads as inert at a glance (HTML form-input convention).
+        s.map(
+            "TCombobox",
+            fieldbackground=[
+                ("readonly", _BG_WID),
+                ("disabled", _BG_PAN),
+            ],
+            foreground=[
+                ("readonly", _FG),
+                ("disabled", _FG_DIM),
+            ],
+            arrowcolor=[
+                ("disabled", _FG_DIM),
+            ],
+            selectbackground=[
+                ("readonly", _BG_WID),
+                ("disabled", _BG_PAN),
+            ],
+            selectforeground=[
+                ("readonly", _FG),
+                ("disabled", _FG_DIM),
+            ],
+        )
+        s.map(
+            "TSpinbox",
+            fieldbackground=[("disabled", _BG_PAN)],
+            foreground=[("disabled", _FG_DIM)],
+            arrowcolor=[("disabled", _FG_DIM)],
+        )
+        s.map(
+            "TEntry",
+            fieldbackground=[("disabled", _BG_PAN)],
+            foreground=[("disabled", _FG_DIM)],
+        )
         s.configure("TScrollbar", background=_BG_PAN, troughcolor=_BG,
                     arrowcolor=_FG_HEAD, bordercolor=_BG,
                     darkcolor=_BG_PAN, lightcolor=_BG_PAN, relief="flat")
