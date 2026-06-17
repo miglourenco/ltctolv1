@@ -592,6 +592,13 @@ class MainWindow:
         self._cur_scene_label = tk.Label(sf, text="—", bg=_BG_PAN, fg=_FG_DIM,
                                          font=_F_MONO)
         self._cur_scene_label.pack(anchor="w", pady=(4, 0))
+        # Persistent "last fired cue" indicator — survives catalog updates and
+        # other status messages so the operator can verify what the engine did.
+        tk.Label(sf, text="LAST FIRE", bg=_BG_PAN, fg=_FG_HEAD,
+                 font=_F_UIB).pack(anchor="w", pady=(8, 0))
+        self._last_fire_label = tk.Label(sf, text="—", bg=_BG_PAN, fg=_FG_DIM,
+                                         font=_F_MONO, justify="left")
+        self._last_fire_label.pack(anchor="w", pady=(4, 0))
 
     def _build_main_split(self, parent: tk.Frame) -> None:
         wrap = tk.Frame(parent, bg=_BG)
@@ -677,6 +684,10 @@ class MainWindow:
         self._cat_tree.configure(yscrollcommand=sb.set)
         # Double-click on a scene recalls it on the LV1 (single-click selects only).
         self._cat_tree.bind("<Double-1>", self._on_catalog_double_click)
+        # Drag a scene onto a cue row → associate the cue with that scene.
+        self._cat_tree.bind("<ButtonPress-1>", self._on_catalog_press, add="+")
+        self._cat_tree.bind("<B1-Motion>", self._on_catalog_motion)
+        self._cat_tree.bind("<ButtonRelease-1>", self._on_catalog_release)
 
     def _build_footer(self, parent: tk.Frame) -> None:
         ftr = tk.Frame(parent, bg=_BG)
@@ -917,6 +928,83 @@ class MainWindow:
         name = self._scene_catalog.get(idx, "(unknown)")
         self._lv1.recall_scene(idx)
         self._set_status(f"Recalled scene [{idx}] {name}")
+
+    # --- Drag-and-drop: scene → cue ----------------------------------------
+
+    def _on_catalog_press(self, event) -> None:
+        """Record the scene under the cursor in case the user drags onto a cue."""
+        row = self._cat_tree.identify_row(event.y)
+        try:
+            self._drag_scene_idx = int(row) if row else None
+        except ValueError:
+            self._drag_scene_idx = None
+        self._dragging = False
+
+    def _on_catalog_motion(self, event) -> None:
+        """Switch cursor to a drag-affordance once the user actually moves."""
+        if getattr(self, "_drag_scene_idx", None) is None:
+            return
+        if not self._dragging:
+            self._dragging = True
+            try:
+                self.root.config(cursor="hand2")
+            except Exception:
+                pass
+
+    def _on_catalog_release(self, event) -> None:
+        """If the release ended over a cue row, assign the scene to that cue."""
+        scene_idx = getattr(self, "_drag_scene_idx", None)
+        was_dragging = getattr(self, "_dragging", False)
+        self._drag_scene_idx = None
+        self._dragging = False
+        try:
+            self.root.config(cursor="")
+        except Exception:
+            pass
+        if scene_idx is None or not was_dragging:
+            return  # not a drag — let single/double click handle it normally
+
+        # Find what widget the mouse is hovering over now
+        target = self.root.winfo_containing(event.x_root, event.y_root)
+        if target is None:
+            return
+        # The cue tree, or a cell inside it — walk up the master chain
+        widget = target
+        while widget is not None:
+            if widget is self._tree:
+                break
+            widget = getattr(widget, "master", None)
+        if widget is not self._tree:
+            return
+
+        # Identify the cue row under the mouse
+        tree_y = event.y_root - self._tree.winfo_rooty()
+        cue_row = self._tree.identify_row(tree_y)
+        if not cue_row:
+            return
+        try:
+            cue_id = int(cue_row)
+        except ValueError:
+            return
+        cue = self._cue_list.by_id(cue_id)
+        if cue is None:
+            return
+
+        scene_name = self._scene_catalog.get(scene_idx, "")
+        self._cue_list.replace(
+            cue_id,
+            scene_name=scene_name,
+            scene_index=scene_idx,
+        )
+        self._engine.load_cue_list(self._cue_list)
+        if self._scene_catalog:
+            self._engine.resolve_against_catalog(self._scene_catalog)
+        self._refresh_tree()
+        self._tree.selection_set(str(cue_id))
+        self._mark_dirty()
+        self._set_status(
+            f"Cue '{cue.label}' → scene [{scene_idx}] {scene_name}"
+        )
 
     def _show_validation_warnings(self) -> None:
         if not self._cue_list.cues:
@@ -1288,14 +1376,16 @@ class MainWindow:
 
     def _on_cue_fired(self, cue: Cue) -> None:
         self._refresh_tree()
-        # Diagnostic: log the LIVE TC at the moment of firing alongside the
-        # cue's target TC. If "fired at" lags the cue's target by more than a
-        # few frames, the firing pipeline is delayed (audio buffer / queue
-        # backlog / poll latency).
+        # Two-line fire indicator: scene that was recalled + timing info.
+        # Persists in the LV1 STATUS column until the next fire — catalog
+        # updates etc. no longer wipe it.
         cur = str(self._current_tc) if self._current_tc else "??:??:??:??"
-        self._set_status(
-            f"Fired @ {cur}: '{cue.label}' target={cue.timecode} → "
-            f"scene {cue.scene_index} ({cue.scene_name or 'unnamed'})"
+        self._last_fire_label.config(
+            text=(
+                f"[{cue.scene_index}] {cue.scene_name or cue.label}\n"
+                f"target {cue.timecode}  fired @ {cur}"
+            ),
+            fg=_FG_OK,
         )
 
     def _on_cue_skipped(self, cue: Cue, reason: str) -> None:
@@ -1401,11 +1491,14 @@ class MainWindow:
         self._status_label.config(text=text, fg=_FG_WARN if warn else _FG_HEAD)
 
     def _log(self, level: str, msg: str) -> None:
-        # We don't have a dedicated log pane — surface as status for now.
+        # Only surface warnings/errors in the status bar — info-level logs
+        # (catalog updates, registration confirmations, etc.) would otherwise
+        # clobber the "fired cue" message, hiding what the operator most needs
+        # to see. Info still goes to stdout for debugging.
         if level in ("warn", "warning", "error"):
             self._set_status(msg, warn=True)
         else:
-            self._set_status(msg)
+            print(f"[lv1] {msg}")
 
     def _show_about(self) -> None:
         messagebox.showinfo(
