@@ -549,9 +549,9 @@ class MainWindow:
                              font=("Segoe UI", 10, "bold"))
         self._run_btn.pack(pady=(0, 4))
 
-        # LV1 connect underneath.
-        self._lv1_btn = _btn(tf, "Connect LV1", self._toggle_lv1,
-                             bg=_BTN_BG, abg=_BTN_ABG, fg=_FG,
+        # LV1 connect underneath. Red = offline (default), green = online.
+        self._lv1_btn = _btn(tf, "● OFFLINE", self._toggle_lv1,
+                             bg=_ST_BG, abg=_ST_ABG, fg="#FFFFFF",
                              width=14, px=12, py=4,
                              font=("Segoe UI", 9, "bold"))
         self._lv1_btn.pack()
@@ -874,17 +874,27 @@ class MainWindow:
         if state.registered:
             txt = f"Connected — {state.host}:{state.port}"
             fg = _FG_OK
-            self._lv1_btn.config(text="Disconnect")
+            self._set_lv1_button(online=True, label="● ONLINE")
         elif state.connected:
             txt = f"Handshaking… ({state.host}:{state.port})"
             fg = _FG_WARN
-            self._lv1_btn.config(text="Disconnect")
+            self._set_lv1_button(online=True, label="● connecting…")
         else:
             err = state.last_error
             txt = f"Disconnected{' — ' + err if err else ''}"
             fg = _FG_ERR if err else _FG_DIM
-            self._lv1_btn.config(text="Connect LV1")
+            self._set_lv1_button(online=False, label="● OFFLINE")
         self._lv1_state_label.config(text=txt, fg=fg)
+
+    def _set_lv1_button(self, online: bool, label: str) -> None:
+        """Update the LV1 connect button: green = online, red = offline."""
+        if online:
+            bg, abg = _GO_BG, _GO_ABG
+        else:
+            bg, abg = _ST_BG, _ST_ABG
+        self._lv1_btn.configure(text=label, bg=bg, fg="#FFFFFF")
+        self._lv1_btn._bg = bg
+        self._lv1_btn._abg = abg
 
     def _on_lv1_catalog(self, snap: SceneCatalogSnapshot) -> None:
         self._scene_catalog = dict(snap.scenes)
