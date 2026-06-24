@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 import socket
 import struct
+import sys
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
@@ -123,9 +124,11 @@ def discover(
             pass
         sock.bind(("", MCAST_PORT))
 
-        # Join the multicast group on every non-loopback IPv4 interface so we
-        # catch the announcement regardless of which NIC the LV1 lives on.
-        joined_any = False
+        # Join the multicast group on EVERY enumerated NIC + the wildcard.
+        # We always add INADDR_ANY too so that if the explicit per-interface
+        # enumeration missed a NIC (e.g. APIPA 169.254.x.x on Windows without
+        # a routable default gateway), the OS-picked default still catches
+        # /zDNS announcements coming in on whatever NIC.
         for ip in _local_ipv4s():
             try:
                 mreq = struct.pack(
@@ -134,17 +137,16 @@ def discover(
                     socket.inet_aton(ip),
                 )
                 sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-                joined_any = True
             except OSError:
+                # already joined, or refused — keep trying the others
                 pass
-        if not joined_any:
-            try:
-                mreq = struct.pack(
-                    "=4sl", socket.inet_aton(MCAST_ADDR), socket.INADDR_ANY
-                )
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-            except OSError:
-                pass
+        try:
+            mreq = struct.pack(
+                "=4sl", socket.inet_aton(MCAST_ADDR), socket.INADDR_ANY
+            )
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except OSError:
+            pass
 
         sock.settimeout(0.5)
         deadline = _now() + timeout_s
@@ -192,25 +194,80 @@ def _now() -> float:
 
 
 def _local_ipv4s() -> List[str]:
-    """Best-effort enumeration of non-loopback IPv4 addresses on this host."""
+    """Best-effort enumeration of non-loopback IPv4 addresses on this host.
+
+    Combines four methods so APIPA (169.254.x.x / auto-IP) NICs are still
+    picked up even when the PC has no routable network:
+      1. socket.gethostbyname_ex(hostname) — usually returns all bound IPs
+      2. socket.getaddrinfo(hostname) — sometimes covers more on Windows
+      3. UDP "connect to 8.8.8.8" trick — fails on link-local-only setups
+      4. UDP "connect to 169.254.1.1" trick — works on link-local setups
+      5. Windows: ipconfig parse fallback (locale-independent regex)
+    """
     ips: set[str] = set()
+
+    def _add(ip: str) -> None:
+        if ip and not ip.startswith("127.") and not ip.startswith("0."):
+            ips.add(ip)
+
+    # 1 & 2: hostname-based lookups
     try:
         host = socket.gethostname()
-        for info in socket.getaddrinfo(host, None, socket.AF_INET):
-            ip = info[4][0]
-            if ip and not ip.startswith("127."):
-                ips.add(ip)
-    except OSError:
+        try:
+            _, _, addrs = socket.gethostbyname_ex(host)
+            for ip in addrs:
+                _add(ip)
+        except (socket.gaierror, OSError):
+            pass
+        try:
+            for info in socket.getaddrinfo(host, None, socket.AF_INET):
+                _add(info[4][0])
+        except OSError:
+            pass
+    except Exception:
         pass
-    # Some systems (esp. Windows) don't expose all NIC IPs via gethostname;
-    # also probe via a connected socket trick.
+
+    # 3: routable internet trick (works on normal LANs)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.5)
         s.connect(("8.8.8.8", 80))
-        ips.add(s.getsockname()[0])
+        _add(s.getsockname()[0])
         s.close()
     except OSError:
         pass
+
+    # 4: link-local trick (works on APIPA / auto-IP / unrouted setups)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.5)
+        s.connect(("169.254.1.1", 80))
+        _add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+
+    # 5: Windows ipconfig fallback — locale-independent IPv4 regex
+    if sys.platform == "win32":
+        try:
+            import subprocess
+            res = subprocess.run(
+                ["ipconfig"],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+            )
+            for m in re.finditer(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b", res.stdout):
+                ip = m.group(1)
+                # Filter out subnet masks (255.x), broadcast (.255), gateways
+                # not relevant here — gateways are picked too but we don't care,
+                # multicast join on a "wrong" IP just fails harmlessly.
+                if ip.startswith("255.") or ip == "0.0.0.0":
+                    continue
+                _add(ip)
+        except Exception:
+            pass
+
     return sorted(ips)
 
 
