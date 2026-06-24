@@ -160,20 +160,30 @@ def discover(
             z = _parse_zdns(buf)
             if not z or z["service"] != filter_service:
                 continue
+            # ALWAYS put the actual packet source IP first. The LV1 announces
+            # the IPs from its OWN side in the payload, but those can be stale
+            # (e.g. if the LV1's IP changed and its cached broadcast hasn't
+            # caught up). The packet source IP is the one the LV1 ACTUALLY
+            # used to send this packet right now → guaranteed reachable.
             ranked = sorted(z["ipv4s"], key=_rank_ip, reverse=True)
+            addresses = [addr[0]]
+            for ip in ranked:
+                if ip not in addresses:
+                    addresses.append(ip)
             key = f"{z['service']}|{z['host']}|{z['port']}"
-            if key in found:
-                continue
+            # Replace any previously-stored entry for this LV1 — later packets
+            # in the scan may have a fresher source IP than the first one.
             entry = DiscoveryEntry(
                 service=z["service"],
                 uuid=z["uuid"],
                 host=z["host"],
                 port=z["port"],
-                addresses=ranked,
+                addresses=addresses,
                 source=addr[0],
             )
+            existed = key in found
             found[key] = entry
-            if on_found:
+            if on_found and not existed:
                 try:
                     on_found(entry)
                 except Exception:
@@ -247,10 +257,11 @@ def _local_ipv4s() -> List[str]:
     except OSError:
         pass
 
-    # 5: Windows ipconfig fallback — locale-independent IPv4 regex
+    # 5: Platform-specific subprocess fallback
+    import subprocess
     if sys.platform == "win32":
+        # ipconfig — match every IPv4 in the output (locale-independent)
         try:
-            import subprocess
             res = subprocess.run(
                 ["ipconfig"],
                 capture_output=True,
@@ -259,14 +270,28 @@ def _local_ipv4s() -> List[str]:
             )
             for m in re.finditer(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b", res.stdout):
                 ip = m.group(1)
-                # Filter out subnet masks (255.x), broadcast (.255), gateways
-                # not relevant here — gateways are picked too but we don't care,
-                # multicast join on a "wrong" IP just fails harmlessly.
                 if ip.startswith("255.") or ip == "0.0.0.0":
                     continue
                 _add(ip)
         except Exception:
             pass
+    else:
+        # macOS / Linux: parse `ifconfig -a` for "inet X.X.X.X" lines.
+        # Use absolute paths because the .app's PATH may not include /sbin.
+        for cmd in (["/sbin/ifconfig", "-a"], ["ifconfig", "-a"],
+                    ["/usr/sbin/ip", "-4", "addr"], ["ip", "-4", "addr"]):
+            try:
+                res = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=3.0,
+                )
+                # 'inet 192.168.1.73' (BSD/macOS ifconfig)
+                # 'inet 192.168.1.73/24' (Linux iproute2)
+                for m in re.finditer(r"\binet\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", res.stdout):
+                    _add(m.group(1))
+                if ips:
+                    break  # got something — no need to try other commands
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                continue
 
     return sorted(ips)
 
