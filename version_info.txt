@@ -9,8 +9,8 @@
 # valid syntax — the script keeps them in sync with _VERSION.
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 1, 0, 0),
-    prodvers=(1, 1, 0, 0),
+    filevers=(2, 0, 1, 0),
+    prodvers=(2, 0, 1, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -25,12 +25,12 @@ VSVersionInfo(
         [
           StringStruct(u'CompanyName',      u'Miguel Lourenço'),
           StringStruct(u'FileDescription',  u'LTC to LV1 Snapshot Recall'),
-          StringStruct(u'FileVersion',      u'1.1.0.0'),
+          StringStruct(u'FileVersion',      u'2.0.1.0'),
           StringStruct(u'InternalName',     u'LTCtoLV1'),
           StringStruct(u'LegalCopyright',   u'© Miguel Lourenço'),
           StringStruct(u'OriginalFilename', u'LTCtoLV1.exe'),
           StringStruct(u'ProductName',      u'LTC to LV1'),
-          StringStruct(u'ProductVersion',   u'1.1.0.0'),
+          StringStruct(u'ProductVersion',   u'2.0.1.0'),
         ]
       ),
     ]),
