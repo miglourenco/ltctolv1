@@ -1,0 +1,39 @@
+# PyInstaller VS_VERSION_INFO resource — embedded into the .exe header.
+# Populates the Windows file Properties ▸ Details pane (CompanyName,
+# ProductName, FileVersion, etc). Real, signed-looking metadata is one of
+# the cheapest ways to reduce SmartScreen / antivirus false positives for
+# unsigned PyInstaller builds.
+#
+# release.bat regex-substitutes the (1, 1, 0, 0) tuples and the matching
+# 'X.Y.Z.0' strings on every build, so the values here only need to be
+# valid syntax — the script keeps them in sync with _VERSION.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 1, 0, 0),
+    prodvers=(1, 1, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0),
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        u'040904B0',
+        [
+          StringStruct(u'CompanyName',      u'Miguel Lourenço'),
+          StringStruct(u'FileDescription',  u'LTC to LV1 Snapshot Recall'),
+          StringStruct(u'FileVersion',      u'1.1.0.0'),
+          StringStruct(u'InternalName',     u'LTCtoLV1'),
+          StringStruct(u'LegalCopyright',   u'© Miguel Lourenço'),
+          StringStruct(u'OriginalFilename', u'LTCtoLV1.exe'),
+          StringStruct(u'ProductName',      u'LTC to LV1'),
+          StringStruct(u'ProductVersion',   u'1.1.0.0'),
+        ]
+      ),
+    ]),
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])]),
+  ],
+)

@@ -84,12 +84,12 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    # Don't compress PortAudio DLLs — UPX breaks some audio DLLs
-    upx_exclude=[
-        'libportaudio64bit.dll',
-        'libportaudio64bit-asio.dll',
-    ],
+    # UPX-packed PyInstaller binaries are one of the strongest single
+    # triggers for SmartScreen / antivirus false positives — packers
+    # are heuristically associated with malware self-extraction. The
+    # resulting .exe is ~30-40 MB larger but downloads cleanly and
+    # runs without "this file is dangerous" prompts on most setups.
+    upx=False,
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
@@ -98,4 +98,8 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=_ico_path,
+    # Embed Windows VS_VERSION_INFO so Explorer / SmartScreen can show
+    # CompanyName + ProductName instead of "Unknown publisher". Helps
+    # the file build reputation more quickly across downloads.
+    version='version_info.txt',
 )

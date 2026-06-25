@@ -1,0 +1,22 @@
+LTC to LV1 — install notes
+==========================
+
+This is an unsigned Windows executable, so Windows SmartScreen and some
+browsers will flag it as "unknown publisher" or even "potentially harmful"
+on first download / first run. The app is safe; it's the standard
+PyInstaller false-positive pattern for unsigned binaries.
+
+Steps to install:
+
+  1. Extract LTCtoLV1.exe somewhere convenient (e.g. C:\LTCtoLV1\).
+  2. RIGHT-CLICK the .exe, choose Properties, tick "Unblock" at the
+     bottom of the General tab, then OK. This removes the Mark-of-the-
+     Web from the file so Windows stops treating it as a fresh internet
+     download every time you run it.
+  3. Double-click LTCtoLV1.exe. If SmartScreen pops up, click
+     "More info" then "Run anyway".
+  4. (Optional) In the app, open File ▸ Web remote settings to enable
+     the web remote and autostart-on-login.
+
+Source code + issue tracker:
+  https://github.com/miglourenco/ltctolv1
