@@ -2,17 +2,20 @@
 LTC to LV1 — main application window (tkinter + ttk).
 
 Threading model:
-  - All UI updates and CueEngine calls happen on the MAIN thread.
-  - Audio runs in its own thread, talks via queue.Queue[Timecode].
-  - LV1Client runs its reader on its own thread; callbacks are marshalled
-    onto the main thread via root.after_idle().
+  - All UI updates happen on the MAIN thread.
+  - All shared state lives in AppController (lv1, audio, engine, cue_list,
+    settings, scene catalog, etc.). MainWindow subscribes to the controller's
+    event bus and marshals every event onto the main thread via after_idle().
+  - Audio runs in its own thread, talks via queue.Queue[Timecode] which is
+    drained by MainWindow's 25 Hz poll loop into controller.drain_tc_queue().
+  - LV1Client runs its reader on its own thread; callbacks land on the
+    controller which then re-emits onto the bus.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import queue
 import ssl
 import sys
 import threading
@@ -20,7 +23,7 @@ import tkinter as tk
 import urllib.request
 import webbrowser
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 try:
     import certifi as _certifi
@@ -28,18 +31,34 @@ try:
 except Exception:
     _SSL_CTX = None
 
-from audio_capture import AudioCapture, get_channel_names, list_audio_devices, reinit_portaudio
-from cue_engine import CueEngine
-from ltc_decoder import Timecode
-from lv1_osc_client import ConnectionState, LV1Client, SceneCatalogSnapshot
-from models import AppSettings, Cue, CueList
-from scene_resolver import CueValidation, validate_all
-from zdns_discover import DiscoveryEntry, DiscoveryScanner
+from app_controller import (
+    AppController,
+    EVT_CUES,
+    EVT_CUE_FIRED,
+    EVT_DIRTY,
+    EVT_DISCOVERY,
+    EVT_LAST_FIRE,
+    EVT_LV1_CATALOG,
+    EVT_LV1_CURRENT,
+    EVT_LV1_STATE,
+    EVT_RECENT,
+    EVT_RUNNING,
+    EVT_SETTINGS,
+    EVT_STATUS,
+    EVT_TC,
+)
+from models import (
+    CUE_FILE_DESCRIPTION,
+    CUE_FILE_EXTENSION,
+    Cue,
+    ensure_projects_dir,
+)
+from scene_resolver import validate_all
 
 
 # --- Constants --------------------------------------------------------------
 
-_VERSION = "1.0.6"
+_VERSION = "1.1.0"
 _GH_OWNER_REPO = "miglourenco/ltctolv1"
 _RELEASES_API = f"https://api.github.com/repos/{_GH_OWNER_REPO}/releases/latest"
 _RELEASES_URL = f"https://github.com/{_GH_OWNER_REPO}/releases"
@@ -221,8 +240,6 @@ class CueDialog(tk.Toplevel):
         scene_row = tk.Frame(body, bg=_BG_PAN)
         scene_row.grid(row=2, column=1, sticky="w", pady=2)
 
-        # Build label list "[idx] name", plus a "(custom)" sentinel so the user
-        # can still hand-type a name that isn't in the catalog (offline editing).
         choices: List[str] = ["(custom — type below)"]
         for idx in sorted(scene_catalog):
             choices.append(f"[{idx}] {scene_catalog[idx]}")
@@ -233,7 +250,6 @@ class CueDialog(tk.Toplevel):
         cb.pack(side="left")
         cb.bind("<<ComboboxSelected>>", self._on_scene_picked)
 
-        # Custom name + index (always visible — also gets populated by the picker)
         sub = tk.Frame(body, bg=_BG_PAN)
         sub.grid(row=3, column=1, sticky="w", pady=2)
         tk.Label(sub, text="Name", bg=_BG_PAN, fg=_FG_HEAD,
@@ -251,20 +267,17 @@ class CueDialog(tk.Toplevel):
                  bg=_BG_WID, fg=_FG, insertbackground=_FG,
                  highlightthickness=0).pack(side="left", padx=4)
 
-        # If editing an existing cue with a name that IS in the catalog, preset the picker.
         if cue and cue.scene_name:
             for ch in choices[1:]:
                 if ch.endswith(f"] {cue.scene_name}"):
                     self._scene_choice_var.set(ch)
                     break
 
-        # Enabled
         self._enabled_var = tk.BooleanVar(value=cue.enabled if cue else True)
         ttk.Checkbutton(body, text="Enabled", variable=self._enabled_var).grid(
             row=4, column=1, sticky="w", pady=(8, 0)
         )
 
-        # Buttons
         btns = tk.Frame(body, bg=_BG_PAN)
         btns.grid(row=5, column=0, columnspan=2, pady=(12, 0))
         _btn(btns, "Save", self._ok, bg=_GO_BG, abg=_GO_ABG, fg="#FFFFFF",
@@ -278,7 +291,6 @@ class CueDialog(tk.Toplevel):
         sel = self._scene_choice_var.get()
         if not sel.startswith("["):
             return
-        # "[5] My Scene Name" → idx=5, name="My Scene Name"
         try:
             rb = sel.index("]")
             idx = int(sel[1:rb])
@@ -313,68 +325,43 @@ class CueDialog(tk.Toplevel):
 
 
 class MainWindow:
-    def __init__(self, root: tk.Tk, settings: AppSettings) -> None:
+    def __init__(self, root: tk.Tk, controller: AppController) -> None:
         self.root = root
-        self.settings = settings
+        self.ctl = controller
+        self.settings = controller.settings
         self.root.configure(bg=_BG)
 
-        # Core objects
-        self._tc_queue: "queue.Queue[Timecode]" = queue.Queue(maxsize=200)
-        self._audio = AudioCapture(self._tc_queue)
-        # Identify this client in the LV1's MyRemote ControlPanel by hostname
-        # so multiple machines running LTCtoLV1 are distinguishable.
-        import socket as _socket
-        try:
-            _hostname = _socket.gethostname() or "unknown"
-        except Exception:
-            _hostname = "unknown"
-        self._lv1 = LV1Client(device_name=f"LTC - {_hostname}")
-        self._cue_list = CueList()
-        self._engine = CueEngine(
-            self._lv1,
-            tolerance_frames=settings.tolerance_frames,
-            dry_run=settings.dry_run,
-        )
-        self._engine.on_cue_fired = self._on_cue_fired
-        self._engine.on_cue_skipped = self._on_cue_skipped
-        self._engine.on_send_error = self._on_send_error
-
-        # Discovery scanner
-        self._scanner = DiscoveryScanner(timeout_s=5.0)
-        self._discovered: List[DiscoveryEntry] = []
-
-        # LV1 callbacks → marshal to UI thread
-        self._lv1.on_connection_change = lambda s: self.root.after_idle(
-            lambda: self._on_lv1_connection(s)
-        )
-        self._lv1.on_catalog_change = lambda c: self.root.after_idle(
-            lambda: self._on_lv1_catalog(c)
-        )
-        self._lv1.on_current_scene_change = lambda i: self.root.after_idle(
-            lambda: self._on_lv1_current_scene(i)
-        )
-        self._lv1.on_log = lambda lvl, m: self.root.after_idle(
-            lambda: self._log(lvl, m)
-        )
-
-        # UI state
-        self._running = False
-        self._recovering = False   # True while waiting to auto-restart after stream death
-        # Tracks the LTC status label state so we only re-paint on change.
-        # Values: None | "LOCKED" | "AUDIO_NOT_LTC" | "NO_SIGNAL"
-        self._last_signal_ok: Optional[str] = None
-        self._current_tc: Optional[Timecode] = None
-        self._current_file: Optional[str] = None
+        # UI-only state (display widgets, drag state, throttling)
         self._flash_after: Optional[str] = None
-        # Frames-since-last-TC counter. The poll loop ticks every 40 ms.
-        self._last_tc_time: int = 0
-        self._audio_devices: List = []
-        self._detected_sr: int = settings.sample_rate
-        self._lv1_state: Optional[ConnectionState] = None
-        self._lv1_current_scene: Optional[int] = None
-        self._scene_catalog: Dict[int, str] = {}
-        # Dirty flag — True when the cue list has unsaved changes.
-        self._dirty: bool = False
+        self._last_tc_time: int = 0          # frames since last TC, for "no signal" timeout
+        self._audio_devices: List[Dict[str, Any]] = []
+        self._validated_once: bool = False
+        # Set during _on_close so late after_idle callbacks bail before touching
+        # destroyed widgets. The controller might still emit events for a few
+        # milliseconds while LV1 reader thread and Flask requests wind down.
+        self._shutting_down: bool = False
+        # True while the window is withdrawn to the system tray. The poll loop
+        # checks this to skip widget mutations (the engine still ticks so
+        # cues continue to fire from the tray).
+        self._ui_hidden: bool = False
+        # Populated by main.py if the tray icon successfully starts.
+        self._tray = None
+
+        # Subscribe to the controller's event bus. Every callback marshals
+        # back to the tk main thread via after_idle().
+        self._unsub = self.ctl.subscribe(self._on_controller_event)
+
+        # Register the "bring desktop UI to front" hook so the web remote's
+        # Open UI button can call back into this window. Imported lazily so
+        # the web_server module's not required at import time for headless
+        # smoke tests.
+        try:
+            import web_server
+            web_server.set_show_ui_hook(
+                lambda: self.root.after_idle(self._show_and_focus)
+            )
+        except Exception:
+            pass
 
         self._apply_theme()
         self._build_ui()
@@ -385,16 +372,83 @@ class MainWindow:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        if settings.last_cue_file and os.path.isfile(settings.last_cue_file):
-            self._load_cue_file(settings.last_cue_file)
+        if self.settings.last_cue_file and os.path.isfile(self.settings.last_cue_file):
+            self._load_cue_file(self.settings.last_cue_file)
 
         # Defer auto-connect until discovery has finished — see _on_discovery_done.
-        # (Auto-connecting during the 5 s scan would fail with "no LV1 selected"
-        # because both the dropdown and the discovered cache are still empty.)
-        self._auto_connect_pending = bool(settings.lv1_selected or settings.lv1_host)
+        self._auto_connect_pending = bool(self.settings.lv1_selected or self.settings.lv1_host)
 
         # Silent update check on startup (no popup unless an update is available)
         self.root.after(4000, lambda: self._check_updates(silent_if_ok=True))
+
+    # === Controller bus → marshal to main thread ============================
+
+    def _on_controller_event(self, name: str, payload: Dict[str, Any]) -> None:
+        """Called on whatever thread the event was emitted from. Schedule the
+        handler on the tk main loop so widget access is safe."""
+        if self._shutting_down:
+            return
+        try:
+            self.root.after_idle(lambda: self._dispatch_event(name, payload))
+        except (RuntimeError, tk.TclError):
+            # tk may already be shutting down — ignore.
+            pass
+
+    def _dispatch_event(self, name: str, payload: Dict[str, Any]) -> None:
+        # Guard against events that landed AFTER the user closed the window:
+        # after_idle fires before destroy completes, and any tk call against a
+        # destroyed widget raises TclError. Bail cleanly.
+        if self._shutting_down:
+            return
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        try:
+            self._dispatch_event_inner(name, payload)
+        except tk.TclError:
+            # Widget destroyed between winfo_exists() and the call.
+            pass
+
+    def _dispatch_event_inner(self, name: str, payload: Dict[str, Any]) -> None:
+        if name == EVT_TC:
+            self._render_tc_from_event(payload)
+        elif name == EVT_RUNNING:
+            self._render_running_from_event(payload)
+        elif name == EVT_LV1_STATE:
+            self._render_lv1_state_from_event(payload)
+        elif name == EVT_LV1_CATALOG:
+            self._refresh_catalog_tree()
+            self._refresh_tree()
+            if not self._validated_once:
+                self._validated_once = True
+                self._show_validation_warnings()
+        elif name == EVT_LV1_CURRENT:
+            idx = payload.get("index")
+            if idx is None:
+                self._cur_scene_label.config(text="—", fg=_FG_DIM)
+            else:
+                name_str = self.ctl.scene_catalog.get(idx, "(unknown)")
+                self._cur_scene_label.config(text=f"[{idx}] {name_str}", fg=_FG_OK)
+            self._refresh_catalog_tree()
+        elif name == EVT_CUES:
+            self._refresh_tree()
+            self._update_file_label()
+        elif name == EVT_CUE_FIRED:
+            self._refresh_tree()
+        elif name == EVT_LAST_FIRE:
+            self._render_last_fire(payload)
+        elif name == EVT_DIRTY:
+            self._update_file_label()
+        elif name == EVT_DISCOVERY:
+            self._render_discovery_from_event(payload)
+        elif name == EVT_STATUS:
+            self._set_status_label(payload.get("text", ""), bool(payload.get("warn")))
+        elif name == EVT_RECENT:
+            self._rebuild_recent_menu()
+        elif name == EVT_SETTINGS:
+            pass  # nothing to refresh — settings widgets are write-through
 
     # === Theme ==============================================================
 
@@ -421,9 +475,6 @@ class MainWindow:
                     bordercolor=_BORDER, lightcolor=_BG_WID, darkcolor=_BG_WID,
                     arrowcolor=_FG_HEAD, selectbackground=_BG_WID,
                     selectforeground=_FG, relief="flat")
-        # Combobox states: readonly = enabled (browse-only), disabled = locked.
-        # The disabled state gets a darker fill + dim text + dim arrow so it
-        # reads as inert at a glance (HTML form-input convention).
         s.map(
             "TCombobox",
             fieldbackground=[
@@ -494,14 +545,29 @@ class MainWindow:
         menu.add_cascade(label="File", menu=file_m)
         file_m.add_command(label="New cue list", command=self._new_list)
         file_m.add_command(label="Open…", command=self._open_list)
+        # Open Recent submenu — rebuilt on every EVT_RECENT so the entries
+        # stay in sync with controller state. Stored on self so the dispatcher
+        # can delete/insert items.
+        self._recent_menu = tk.Menu(file_m, tearoff=0)
+        file_m.add_cascade(label="Open recent", menu=self._recent_menu)
+        self._file_menu = file_m  # kept so the dispatcher can probe item count
+        self._rebuild_recent_menu()
         file_m.add_separator()
         file_m.add_command(label="Save", command=self._save_list)
         file_m.add_command(label="Save as…", command=self._save_list_as)
         file_m.add_separator()
+        file_m.add_command(label="Web remote settings…", command=self._show_web_settings)
+        if sys.platform == "win32":
+            file_m.add_command(label=f"Associate {CUE_FILE_EXTENSION} files with this app",
+                               command=self._associate_file_type)
+        file_m.add_separator()
+        file_m.add_command(label="Minimize to tray", command=self._minimize_to_tray)
         file_m.add_command(label="Exit", command=self._on_close)
 
         help_m = tk.Menu(menu, tearoff=0)
         menu.add_cascade(label="Help", menu=help_m)
+        help_m.add_command(label="Open web remote in browser",
+                           command=self._open_web_remote)
         help_m.add_command(label="Check for updates…",
                            command=lambda: self._check_updates(silent_if_ok=False))
         help_m.add_separator()
@@ -544,8 +610,6 @@ class MainWindow:
                                       values=["44100", "48000", "96000"],
                                       width=7, state="disabled")
         self._sr_combo.pack(side="left")
-        # Buffer size — affects callback latency. Smaller = lower latency
-        # but higher CPU. Take effect on next START.
         tk.Label(ar, text="Buffer:", bg=_BG_PAN, fg=_FG_HEAD, font=_F_UI).pack(side="left", padx=(8, 2))
         self._block_var = tk.StringVar(value=str(self.settings.block_size))
         self._block_combo = ttk.Combobox(
@@ -579,19 +643,15 @@ class MainWindow:
                  bg=_BG_WID, fg=_FG, insertbackground=_FG,
                  highlightthickness=0).pack(side="left", padx=4)
 
-        # Right: single transport button (toggles START ↔ STOP) above the
-        # LV1 connect button, both right-aligned.
         tf = tk.Frame(body, bg=_BG_PAN, padx=8)
         tf.pack(side="right", fill="y", pady=2)
 
-        # Transport button on top — same dimensions as the LV1 connect button.
         self._run_btn = _btn(tf, "▶  START", self._toggle_run,
                              bg=_GO_BG, abg=_GO_ABG, fg="#FFFFFF",
                              width=14, px=12, py=4,
                              font=("Segoe UI", 9, "bold"))
         self._run_btn.pack(pady=(0, 4))
 
-        # LV1 connect underneath. Red = offline (default), green = online.
         self._lv1_btn = _btn(tf, "● OFFLINE", self._toggle_lv1,
                              bg=_ST_BG, abg=_ST_ABG, fg="#FFFFFF",
                              width=14, px=12, py=4,
@@ -602,7 +662,6 @@ class MainWindow:
         wrap = tk.Frame(parent, bg=_BG)
         wrap.pack(fill="x", pady=(0, 6))
 
-        # Left: TC display
         tcf = tk.Frame(wrap, bg=_BG_TC,
                        highlightthickness=1, highlightbackground=_BORDER,
                        padx=14, pady=10)
@@ -610,7 +669,6 @@ class MainWindow:
         self._tc_label = tk.Label(tcf, text="00:00:00:00", bg=_BG_TC, fg=_TC_OFF,
                                   font=_F_TC)
         self._tc_label.pack()
-        # Status row: signal indicator + FPS, side-by-side under the TC display
         row = tk.Frame(tcf, bg=_BG_TC)
         row.pack(fill="x")
         self._ltc_status = tk.Label(row, text="● Stopped", bg=_BG_TC, fg=_FG_DIM,
@@ -620,7 +678,6 @@ class MainWindow:
                                    font=_F_FPS)
         self._fps_label.pack(side="right")
 
-        # Right: LV1 status + current scene
         sf = tk.Frame(wrap, bg=_BG_PAN, padx=12, pady=8,
                       highlightthickness=1, highlightbackground=_BORDER)
         sf.pack(side="left", fill="both", expand=True, padx=(8, 0))
@@ -634,8 +691,6 @@ class MainWindow:
         self._cur_scene_label = tk.Label(sf, text="—", bg=_BG_PAN, fg=_FG_DIM,
                                          font=_F_MONO)
         self._cur_scene_label.pack(anchor="w", pady=(4, 0))
-        # Persistent "last fired cue" indicator — survives catalog updates and
-        # other status messages so the operator can verify what the engine did.
         tk.Label(sf, text="LAST FIRE", bg=_BG_PAN, fg=_FG_HEAD,
                  font=_F_UIB).pack(anchor="w", pady=(8, 0))
         self._last_fire_label = tk.Label(sf, text="—", bg=_BG_PAN, fg=_FG_DIM,
@@ -658,7 +713,6 @@ class MainWindow:
         self._file_label = tk.Label(hdr, text="(unsaved)", bg=_BG_HDR,
                                     fg=_FG_DIM, font=_F_UI)
         self._file_label.pack(side="right", padx=8)
-        # Initial label state is set later via _update_file_label() once _dirty exists
 
         body = tk.Frame(wrap, bg=_BG_PAN, padx=4, pady=4,
                         highlightthickness=1, highlightbackground=_BORDER)
@@ -688,7 +742,6 @@ class MainWindow:
         self._tree.bind("<Double-1>", lambda _e: self._edit_cue())
         self._tree.bind("<Button-1>", self._on_tree_click)
 
-        # Buttons row
         br = tk.Frame(wrap, bg=_BG)
         br.pack(fill="x", pady=(4, 0))
         _btn(br, "Quick Add +", self._tap).pack(side="left", padx=2)
@@ -708,7 +761,6 @@ class MainWindow:
         hdr.pack(fill="x")
         tk.Label(hdr, text="LV1 SCENES", bg=_BG_HDR, fg=_FG_HEAD,
                  font=_F_UIB, padx=8, pady=3).pack(side="left")
-        # Inline hint so the gestures are discoverable
         hint_font = (
             ("Segoe UI", 8, "italic") if sys.platform == "win32"
             else ("Helvetica Neue", 10, "italic")
@@ -732,9 +784,7 @@ class MainWindow:
         sb = ttk.Scrollbar(body, orient="vertical", command=self._cat_tree.yview)
         sb.pack(side="right", fill="y")
         self._cat_tree.configure(yscrollcommand=sb.set)
-        # Double-click on a scene recalls it on the LV1 (single-click selects only).
         self._cat_tree.bind("<Double-1>", self._on_catalog_double_click)
-        # Drag a scene onto a cue row → associate the cue with that scene.
         self._cat_tree.bind("<ButtonPress-1>", self._on_catalog_press, add="+")
         self._cat_tree.bind("<B1-Motion>", self._on_catalog_motion)
         self._cat_tree.bind("<ButtonRelease-1>", self._on_catalog_release)
@@ -748,9 +798,6 @@ class MainWindow:
         sp = ttk.Spinbox(ftr, from_=0, to=10, width=4, textvariable=self._tol_var,
                          command=self._update_tolerance)
         sp.pack(side="left", padx=(4, 12))
-        # ttk.Spinbox' `command=` only fires when the user clicks the arrows;
-        # direct typing into the field is silent. Trace the StringVar so ANY
-        # change (arrows OR typing) gets reflected in the engine immediately.
         self._tol_var.trace_add("write", lambda *_: self._update_tolerance())
         self._dry_var = tk.BooleanVar(value=self.settings.dry_run)
         ttk.Checkbutton(ftr, text="Dry-run (don't send OSC)",
@@ -762,8 +809,7 @@ class MainWindow:
     # === Device enumeration =================================================
 
     def _refresh_audio_devices(self) -> None:
-        reinit_portaudio()
-        self._audio_devices = list_audio_devices()
+        self._audio_devices = self.ctl.refresh_audio_devices()
         names = [f"{d['name']}  ({d['hostapi']})" for d in self._audio_devices]
         self._audio_combo.configure(values=names)
         if names and not self._audio_var.get():
@@ -789,9 +835,7 @@ class MainWindow:
             return
         dev = self._audio_devices[idx]
         n_ch = int(dev.get("channels", 1))
-        names = get_channel_names(dev["index"], n_ch, dev.get("hostapi", ""))
-        if not names:
-            names = [f"Ch {i + 1}" for i in range(n_ch)]
+        names = self.ctl.channel_names(dev["index"]) or [f"Ch {i + 1}" for i in range(n_ch)]
         labels = [f"{i + 1} — {n}" for i, n in enumerate(names)]
         self._ch_combo.configure(values=labels)
         if labels:
@@ -813,40 +857,32 @@ class MainWindow:
     # === LV1 discovery ======================================================
 
     def _start_discovery(self) -> None:
-        if self._scanner.is_running:
+        if not self.ctl.start_discovery():
             return
-        self._set_status("Scanning for LV1s…")
-        # Show a "Discovering…" placeholder in the dropdown for the duration of the scan
         self._lv1_disc_combo.configure(values=["Discovering LV1s on the LAN…"])
         self._lv1_disc_var.set("Discovering LV1s on the LAN…")
-        self._scanner.start(on_complete=lambda res: self.root.after_idle(
-            lambda: self._on_discovery_done(res)
-        ))
 
-    def _on_discovery_done(self, results: List[DiscoveryEntry]) -> None:
-        self._discovered = results
+    def _render_discovery_from_event(self, payload: Dict[str, Any]) -> None:
+        scanning = bool(payload.get("scanning"))
+        if scanning:
+            return  # already painted in _start_discovery
+        results = payload.get("results", [])
         labels = ["(none — use IP override)"]
         for r in results:
-            ip = r.addresses[0] if r.addresses else "?"
-            labels.append(f"{r.host or 'unknown'}  —  {ip}:{r.port or '?'}")
+            ip = r.get("ip") or "?"
+            labels.append(f"{r.get('host') or 'unknown'}  —  {ip}:{r.get('port') or '?'}")
         self._lv1_disc_combo.configure(values=labels)
-        # Restore previous selection if it still exists
         target = self.settings.lv1_selected
         chosen_label = labels[0]
         for i, r in enumerate(results, start=1):
-            ip = r.addresses[0] if r.addresses else ""
-            if f"{ip}:{r.port}" == target:
+            if f"{r.get('ip')}:{r.get('port')}" == target:
                 chosen_label = labels[i]
                 break
         else:
             if results:
                 chosen_label = labels[1]
         self._lv1_disc_var.set(chosen_label)
-        self._set_status(f"Discovery: {len(results)} LV1{'s' if len(results) != 1 else ''} found")
 
-        # Now that discovery has populated the dropdown / cache, honour any
-        # pending auto-connect from settings (silently — no popup if nothing
-        # to connect to, since the user didn't click Connect).
         if getattr(self, "_auto_connect_pending", False):
             self._auto_connect_pending = False
             if self._resolve_target(quiet=True) is not None:
@@ -854,7 +890,7 @@ class MainWindow:
 
     # === LV1 connect ========================================================
 
-    def _resolve_target(self, quiet: bool = False) -> Optional[tuple[str, int]]:
+    def _resolve_target(self, quiet: bool = False):
         manual_host = self._lv1_host_var.get().strip()
         manual_port = 0
         try:
@@ -864,9 +900,8 @@ class MainWindow:
 
         if manual_host and manual_port > 0:
             return manual_host, manual_port
-        # If host given but port=0, look it up in the discovered list
         if manual_host:
-            for r in self._discovered:
+            for r in self.ctl.discovered:
                 if manual_host in r.addresses and r.port:
                     return manual_host, r.port
             if not quiet:
@@ -877,20 +912,21 @@ class MainWindow:
                     "the dropdown.",
                 )
             return None
-        # Otherwise, use the dropdown selection
         sel = self._lv1_disc_var.get()
         for i, label in enumerate(self._lv1_disc_combo["values"]):
             if label == sel and i > 0:
-                r = self._discovered[i - 1]
-                ip = r.addresses[0] if r.addresses else ""
-                if ip and r.port:
-                    return ip, r.port
+                idx = i - 1
+                if idx < len(self.ctl.discovered):
+                    r = self.ctl.discovered[idx]
+                    ip = r.addresses[0] if r.addresses else ""
+                    if ip and r.port:
+                        return ip, r.port
         if not quiet:
             messagebox.showinfo("LV1", "No LV1 selected and no manual override.")
         return None
 
     def _toggle_lv1(self) -> None:
-        if self._lv1.is_connected() or (self._lv1_state and self._lv1_state.connected):
+        if self.ctl.lv1.is_connected() or (self.ctl.lv1_state and self.ctl.lv1_state.connected):
             self._disconnect_lv1()
         else:
             self._connect_lv1()
@@ -900,66 +936,56 @@ class MainWindow:
         if not target:
             return
         host, port = target
-        # Immediate feedback before the reader thread reports back.
         self._set_lv1_button(online=True, label="● connecting…")
-        self._lv1_state_label.config(text=f"Connecting to {host}:{port}…",
-                                      fg=_FG_WARN)
-        self._lv1.auto_reconnect = True
-        self._lv1.connect(host, port)
+        self._lv1_state_label.config(text=f"Connecting to {host}:{port}…", fg=_FG_WARN)
+        self.ctl.lv1_connect(host, port)
+        # Persist manual override fields too (lv1_host/port are overwritten
+        # by lv1_connect; lv1_selected captures the dropdown choice).
         self.settings.lv1_host = self._lv1_host_var.get().strip()
         try:
             self.settings.lv1_port = int(self._lv1_port_var.get().strip() or "0")
         except ValueError:
             self.settings.lv1_port = 0
-        # Save discovery selection
         sel = self._lv1_disc_var.get()
         for i, label in enumerate(self._lv1_disc_combo["values"]):
             if label == sel and i > 0:
-                r = self._discovered[i - 1]
-                ip = r.addresses[0] if r.addresses else ""
-                if ip and r.port:
-                    self.settings.lv1_selected = f"{ip}:{r.port}"
-                    break
+                idx = i - 1
+                if idx < len(self.ctl.discovered):
+                    r = self.ctl.discovered[idx]
+                    ip = r.addresses[0] if r.addresses else ""
+                    if ip and r.port:
+                        self.settings.lv1_selected = f"{ip}:{r.port}"
+                        break
 
     def _disconnect_lv1(self) -> None:
-        # Immediate visual feedback — disconnect() can take a moment to wind
-        # down the reader thread, so we don't want the button to look ONLINE
-        # while we're actually tearing the connection down.
         self._set_lv1_button(online=False, label="● disconnecting…")
         self._lv1_state_label.config(text="Disconnecting…", fg=_FG_WARN)
-        self._lv1.auto_reconnect = False
-        # Run the actual disconnect on a worker thread. LV1Client.disconnect()
-        # calls reader.join(timeout=2.0), which would freeze the entire main
-        # thread (including the TC display poll loop) until the reader exits.
-        # The connection_change callback fires with connected=False once the
-        # reader finishes — that's what updates the button to "● OFFLINE".
-        threading.Thread(
-            target=self._lv1.disconnect,
-            name="LV1DisconnectWorker",
-            daemon=True,
-        ).start()
+        self.ctl.lv1_disconnect_async()
 
-    # === LV1 callbacks (already marshalled to UI thread) ====================
+    # === LV1 event rendering ================================================
 
-    def _on_lv1_connection(self, state: ConnectionState) -> None:
-        self._lv1_state = state
-        if state.registered:
-            txt = f"Connected — {state.host}:{state.port}"
+    def _render_lv1_state_from_event(self, payload: Dict[str, Any]) -> None:
+        connected = bool(payload.get("connected"))
+        registered = bool(payload.get("registered"))
+        host = payload.get("host")
+        port = payload.get("port")
+        last_error = payload.get("last_error")
+        if registered:
+            txt = f"Connected — {host}:{port}"
             fg = _FG_OK
             self._set_lv1_button(online=True, label="● ONLINE")
-        elif state.connected:
-            txt = f"Handshaking… ({state.host}:{state.port})"
+        elif connected:
+            txt = f"Handshaking… ({host}:{port})"
             fg = _FG_WARN
             self._set_lv1_button(online=True, label="● connecting…")
         else:
-            err = state.last_error
+            err = last_error
             txt = f"Disconnected{' — ' + err if err else ''}"
             fg = _FG_ERR if err else _FG_DIM
             self._set_lv1_button(online=False, label="● OFFLINE")
         self._lv1_state_label.config(text=txt, fg=fg)
 
     def _set_lv1_button(self, online: bool, label: str) -> None:
-        """Update the LV1 connect button: green = online, red = offline."""
         if online:
             bg, abg = _GO_BG, _GO_ABG
         else:
@@ -968,35 +994,15 @@ class MainWindow:
         self._lv1_btn._bg = bg
         self._lv1_btn._abg = abg
 
-    def _on_lv1_catalog(self, snap: SceneCatalogSnapshot) -> None:
-        self._scene_catalog = dict(snap.scenes)
-        self._refresh_catalog_tree()
-        self._engine.resolve_against_catalog(self._scene_catalog)
-        self._refresh_tree()
-        # Validation warning popup — only on first catalog arrival per session
-        if not getattr(self, "_validated_once", False):
-            self._validated_once = True
-            self._show_validation_warnings()
-
-    def _on_lv1_current_scene(self, idx: Optional[int]) -> None:
-        self._lv1_current_scene = idx
-        if idx is None:
-            self._cur_scene_label.config(text="—", fg=_FG_DIM)
-        else:
-            name = self._scene_catalog.get(idx, "(unknown)")
-            self._cur_scene_label.config(text=f"[{idx}] {name}", fg=_FG_OK)
-        self._refresh_catalog_tree()
-
     def _refresh_catalog_tree(self) -> None:
         self._cat_tree.delete(*self._cat_tree.get_children())
-        cur = self._lv1_current_scene
-        for idx in sorted(self._scene_catalog):
-            name = self._scene_catalog[idx]
+        cur = self.ctl.lv1_current_scene
+        for idx in sorted(self.ctl.scene_catalog):
+            name = self.ctl.scene_catalog[idx]
             tags = ("current",) if idx == cur else ()
             self._cat_tree.insert("", "end", iid=str(idx), values=(idx, name), tags=tags)
 
     def _on_catalog_double_click(self, _e=None) -> None:
-        """Double-click on the LV1 scene catalog → recall that scene on the LV1."""
         sel = self._cat_tree.selection()
         if not sel:
             return
@@ -1004,17 +1010,19 @@ class MainWindow:
             idx = int(sel[0])
         except ValueError:
             return
-        if not self._lv1.is_connected():
+        if not self.ctl.lv1.is_connected():
             messagebox.showwarning("Not connected", "Connect to the LV1 first.")
             return
-        name = self._scene_catalog.get(idx, "(unknown)")
-        self._lv1.recall_scene(idx)
-        self._set_status(f"Recalled scene [{idx}] {name}")
+        ok, err = self.ctl.lv1_recall_scene(idx)
+        if not ok:
+            messagebox.showwarning("Recall failed", err or "Unknown error")
+            return
+        name = self.ctl.scene_catalog.get(idx, "(unknown)")
+        self.ctl.set_status(f"Recalled scene [{idx}] {name}")
 
     # --- Drag-and-drop: scene → cue ----------------------------------------
 
     def _on_catalog_press(self, event) -> None:
-        """Record the scene under the cursor in case the user drags onto a cue."""
         row = self._cat_tree.identify_row(event.y)
         try:
             self._drag_scene_idx = int(row) if row else None
@@ -1023,7 +1031,6 @@ class MainWindow:
         self._dragging = False
 
     def _on_catalog_motion(self, event) -> None:
-        """Switch cursor to a drag-affordance once the user actually moves."""
         if getattr(self, "_drag_scene_idx", None) is None:
             return
         if not self._dragging:
@@ -1034,7 +1041,6 @@ class MainWindow:
                 pass
 
     def _on_catalog_release(self, event) -> None:
-        """If the release ended over a cue row, assign the scene to that cue."""
         scene_idx = getattr(self, "_drag_scene_idx", None)
         was_dragging = getattr(self, "_dragging", False)
         self._drag_scene_idx = None
@@ -1044,13 +1050,11 @@ class MainWindow:
         except Exception:
             pass
         if scene_idx is None or not was_dragging:
-            return  # not a drag — let single/double click handle it normally
+            return
 
-        # Find what widget the mouse is hovering over now
         target = self.root.winfo_containing(event.x_root, event.y_root)
         if target is None:
             return
-        # The cue tree, or a cell inside it — walk up the master chain
         widget = target
         while widget is not None:
             if widget is self._tree:
@@ -1059,7 +1063,6 @@ class MainWindow:
         if widget is not self._tree:
             return
 
-        # Identify the cue row under the mouse
         tree_y = event.y_root - self._tree.winfo_rooty()
         cue_row = self._tree.identify_row(tree_y)
         if not cue_row:
@@ -1068,31 +1071,14 @@ class MainWindow:
             cue_id = int(cue_row)
         except ValueError:
             return
-        cue = self._cue_list.by_id(cue_id)
-        if cue is None:
-            return
-
-        scene_name = self._scene_catalog.get(scene_idx, "")
-        self._cue_list.replace(
-            cue_id,
-            scene_name=scene_name,
-            scene_index=scene_idx,
-        )
-        self._engine.load_cue_list(self._cue_list)
-        if self._scene_catalog:
-            self._engine.resolve_against_catalog(self._scene_catalog)
-        self._refresh_tree()
-        self._tree.selection_set(str(cue_id))
-        self._mark_dirty()
-        self._set_status(
-            f"Cue '{cue.label}' → scene [{scene_idx}] {scene_name}"
-        )
+        if self.ctl.assign_scene_to_cue(cue_id, scene_idx):
+            self._tree.selection_set(str(cue_id))
 
     def _show_validation_warnings(self) -> None:
-        if not self._cue_list.cues:
+        if not self.ctl.cue_list.cues:
             return
         issues = [
-            v for v in validate_all(self._cue_list.cues, self._scene_catalog)
+            v for v in validate_all(self.ctl.cue_list.cues, self.ctl.scene_catalog)
             if v.resolution.status in ("MISSING", "EMPTY")
         ]
         if not issues:
@@ -1115,44 +1101,29 @@ class MainWindow:
 
     # === Dirty tracking =====================================================
 
-    def _mark_dirty(self) -> None:
-        if self._dirty:
-            return
-        self._dirty = True
-        self._update_file_label()
-
-    def _clear_dirty(self) -> None:
-        self._dirty = False
-        self._update_file_label()
-
     def _update_file_label(self) -> None:
-        base = os.path.basename(self._current_file) if self._current_file else "(unsaved)"
-        self._file_label.config(text=("• " + base) if self._dirty else base)
+        base = os.path.basename(self.ctl.current_file) if self.ctl.current_file else "(unsaved)"
+        self._file_label.config(text=("• " + base) if self.ctl.dirty else base)
 
     def _confirm_discard_changes(self, prompt: str) -> bool:
-        """If there are unsaved changes, ask the user to Save / Don't save / Cancel.
-        Returns True if it's OK to proceed (changes saved or discarded);
-        False if the user cancelled."""
-        if not self._dirty:
+        if not self.ctl.dirty:
             return True
         ans = messagebox.askyesnocancel(
             "Unsaved changes",
             prompt + "\n\nSave changes first?",
         )
-        if ans is None:  # Cancel
+        if ans is None:
             return False
-        if ans:  # Yes — save
+        if ans:
             self._save_list()
-            # If save was cancelled (no path picked), _dirty stays True
-            return not self._dirty
-        # No — discard
+            return not self.ctl.dirty
         return True
 
     # === Cue list ops =======================================================
 
     def _refresh_tree(self) -> None:
         self._tree.delete(*self._tree.get_children())
-        for i, c in enumerate(self._cue_list.cues, start=1):
+        for i, c in enumerate(self.ctl.cue_list.cues, start=1):
             scene_disp = (
                 f"[{c.scene_index}] {c.scene_name}"
                 if c.scene_name and c.scene_index is not None
@@ -1181,7 +1152,7 @@ class MainWindow:
         sel = self._tree.selection()
         if not sel:
             return None
-        return self._cue_list.by_id(int(sel[0]))
+        return self.ctl.cue_list.by_id(int(sel[0]))
 
     def _on_tree_click(self, e) -> None:
         region = self._tree.identify("region", e.x, e.y)
@@ -1189,35 +1160,29 @@ class MainWindow:
         if region == "cell" and col == "#6":  # the enabled column
             row = self._tree.identify_row(e.y)
             if row:
-                self._toggle_enabled(int(row))
+                self.ctl.toggle_cue_enabled(int(row))
 
     def _add_cue(self) -> None:
-        CueDialog(self.root, None, self._scene_catalog, self._on_dialog_save)
+        CueDialog(self.root, None, dict(self.ctl.scene_catalog), self._on_dialog_save)
 
     def _edit_cue(self) -> None:
         cue = self._selected_cue()
         if cue is None:
             return
-        CueDialog(self.root, cue, self._scene_catalog,
+        CueDialog(self.root, cue, dict(self.ctl.scene_catalog),
                   lambda **kw: self._on_dialog_save(cue_id=cue.id, **kw))
 
     def _on_dialog_save(self, cue_id: Optional[int] = None, **kw) -> None:
         if cue_id is None:
-            self._cue_list.add(
+            self.ctl.add_cue(
                 label=kw.get("label", ""),
                 timecode=kw.get("timecode", "00:00:00:00"),
                 scene_name=kw.get("scene_name", ""),
                 scene_index=kw.get("scene_index"),
+                enabled=kw.get("enabled", True),
             )
-            new = self._cue_list.cues[-1]
-            new.enabled = kw.get("enabled", True)
         else:
-            self._cue_list.replace(cue_id, **kw)
-        self._engine.load_cue_list(self._cue_list)
-        if self._scene_catalog:
-            self._engine.resolve_against_catalog(self._scene_catalog)
-        self._refresh_tree()
-        self._mark_dirty()
+            self.ctl.update_cue(cue_id, **kw)
 
     def _remove_cue(self) -> None:
         cue = self._selected_cue()
@@ -1225,91 +1190,51 @@ class MainWindow:
             return
         if not messagebox.askyesno("Remove cue", f"Remove cue '{cue.label}'?"):
             return
-        self._cue_list.remove(cue.id)
-        self._engine.load_cue_list(self._cue_list)
-        self._refresh_tree()
-        self._mark_dirty()
+        self.ctl.remove_cue(cue.id)
 
     def _move_up(self) -> None:
         cue = self._selected_cue()
-        if cue and self._cue_list.move_up(cue.id):
-            self._engine.load_cue_list(self._cue_list)
-            self._refresh_tree()
+        if cue and self.ctl.move_cue_up(cue.id):
             self._tree.selection_set(str(cue.id))
-            self._mark_dirty()
 
     def _move_down(self) -> None:
         cue = self._selected_cue()
-        if cue and self._cue_list.move_down(cue.id):
-            self._engine.load_cue_list(self._cue_list)
-            self._refresh_tree()
+        if cue and self.ctl.move_cue_down(cue.id):
             self._tree.selection_set(str(cue.id))
-            self._mark_dirty()
-
-    def _toggle_enabled(self, cue_id: int) -> None:
-        cue = self._cue_list.by_id(cue_id)
-        if cue is None:
-            return
-        cue.enabled = not cue.enabled
-        self._refresh_tree()
-        self._tree.selection_set(str(cue.id))
-        self._mark_dirty()
 
     def _tap(self) -> None:
-        if self._current_tc is None:
-            return
-        tc_str = str(self._current_tc)
-        new = self._cue_list.add(
-            label=f"Cue {len(self._cue_list) + 1}",
-            timecode=tc_str,
-        )
-        self._engine.load_cue_list(self._cue_list)
-        if self._scene_catalog:
-            self._engine.resolve_against_catalog(self._scene_catalog)
-        self._refresh_tree()
-        self._tree.selection_set(str(new.id))
-        self._mark_dirty()
+        new = self.ctl.tap_at_current_tc()
+        if new is not None:
+            self._tree.selection_set(str(new.id))
 
     def _test_fire(self) -> None:
         cue = self._selected_cue()
         if cue is None:
             return
-        if cue.scene_index is None or cue.scene_status in ("MISSING", "EMPTY"):
-            messagebox.showwarning(
-                "Cannot fire",
-                f"Cue '{cue.label}' has no resolved LV1 scene.",
-            )
-            return
-        if self._dry_var.get():
-            self._log("info", f"[dry-run] would recall scene {cue.scene_index}")
-            return
-        if not self._lv1.is_connected():
-            messagebox.showwarning("Not connected", "Connect to the LV1 first.")
-            return
-        self._lv1.recall_scene(cue.scene_index)
-        self._set_status(f"Test fire: scene {cue.scene_index} → {cue.scene_name}")
+        ok, err = self.ctl.test_fire_cue(cue.id)
+        if not ok and err:
+            messagebox.showwarning("Cannot fire", err)
 
     def _reset_fired(self) -> None:
-        self._engine.reset()
+        self.ctl.reset_fired()
 
     def _revalidate(self) -> None:
-        if not self._scene_catalog:
+        if not self.ctl.scene_catalog:
             messagebox.showinfo("Re-validate", "Not connected to an LV1 yet.")
             return
-        self._engine.resolve_against_catalog(self._scene_catalog)
-        self._refresh_tree()
+        self.ctl.revalidate()
         self._show_validation_warnings()
 
     # === Audio start/stop ===================================================
 
     def _toggle_run(self) -> None:
-        if self._running:
+        if self.ctl.running:
             self._stop()
         else:
             self._start()
 
     def _start(self) -> None:
-        if self._running:
+        if self.ctl.running:
             return
         sel = self._audio_var.get()
         idx = next(
@@ -1331,61 +1256,47 @@ class MainWindow:
             block_size = int(self._block_var.get())
         except ValueError:
             block_size = 512
-        try:
-            self._audio.configure(dev["index"], ch1 - 1, sr, block_size)
-            self._audio.start()
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Audio", f"Failed to start audio:\n{exc}")
+
+        ok, err = self.ctl.start_capture(
+            device_index=dev["index"],
+            channel_zero_based=ch1 - 1,
+            sample_rate=sr,
+            block_size=block_size,
+            device_label=sel.split("  (")[0],
+        )
+        if not ok:
+            messagebox.showerror("Audio", f"Failed to start audio:\n{err}")
             return
 
         # Auto-connect the LV1 too, if a target is configured.
-        if not self._lv1.is_connected() and self._resolve_target(quiet=True) is not None:
+        if not self.ctl.lv1.is_connected() and self._resolve_target(quiet=True) is not None:
             self._connect_lv1()
 
-        self._running = True
-        self._recovering = False
-        self._last_signal_ok = None
-        self._last_tc_time = 0
-        self._ltc_status.config(text="● Waiting for LTC signal…", fg=_FG_WARN)
-        # Morph the transport button into STOP mode
-        self._run_btn.configure(text="■  STOP", bg=_ST_BG, fg="#FFFFFF")
-        self._run_btn._bg = _ST_BG
-        self._run_btn._abg = _ST_ABG
-        # Lock audio controls — changing them mid-stream has no effect and
-        # would mislead the operator into thinking the new value is in use.
-        self._set_audio_controls_enabled(False)
-        self.settings.audio_device = sel.split("  (")[0]
-        self.settings.audio_channel = ch1
-        self.settings.block_size = block_size
-
     def _stop(self) -> None:
-        if not self._running:
-            return
-        try:
-            self._audio.stop()
-        except Exception:
-            pass
-        self._running = False
-        self._recovering = False
-        self._last_signal_ok = None
-        self._ltc_status.config(text="● Stopped", fg=_FG_DIM)
-        # Morph the transport button back into START mode
-        self._run_btn.configure(text="▶  START", bg=_GO_BG, fg="#FFFFFF")
-        self._run_btn._bg = _GO_BG
-        self._run_btn._abg = _GO_ABG
-        self._tc_label.config(fg=_TC_OFF)
-        # Unlock audio controls
-        self._set_audio_controls_enabled(True)
+        self.ctl.stop_capture()
+
+    def _render_running_from_event(self, payload: Dict[str, Any]) -> None:
+        running = bool(payload.get("running"))
+        if running:
+            self._last_tc_time = 0
+            self._ltc_status.config(text="● Waiting for LTC signal…", fg=_FG_WARN)
+            self._run_btn.configure(text="■  STOP", bg=_ST_BG, fg="#FFFFFF")
+            self._run_btn._bg = _ST_BG
+            self._run_btn._abg = _ST_ABG
+            self._set_audio_controls_enabled(False)
+        else:
+            self._ltc_status.config(text="● Stopped", fg=_FG_DIM)
+            self._run_btn.configure(text="▶  START", bg=_GO_BG, fg="#FFFFFF")
+            self._run_btn._bg = _GO_BG
+            self._run_btn._abg = _GO_ABG
+            self._tc_label.config(fg=_TC_OFF)
+            self._set_audio_controls_enabled(True)
 
     def _set_audio_controls_enabled(self, enabled: bool) -> None:
-        """Enable / disable all audio settings widgets. Called from start/stop
-        so the operator can't change inputs / SR / buffer mid-stream (those
-        only take effect on the next start anyway)."""
         combo_state = "readonly" if enabled else "disabled"
         self._audio_combo.configure(state=combo_state)
         self._ch_combo.configure(state=combo_state)
         self._block_combo.configure(state=combo_state)
-        # Sample-rate combo is special — it's only active when SR Force is on.
         if enabled and self._sr_force_var.get():
             self._sr_combo.configure(state="readonly")
         else:
@@ -1394,49 +1305,42 @@ class MainWindow:
     # === Timecode polling ===================================================
 
     def _poll_queue(self) -> None:
-        """Main thread, ~25 Hz. Drains the timecode queue into the cue engine,
-        updates the TC display, and polls the audio capture for signal status
-        and stream health (driver reset auto-recovery)."""
-        if self._running and not self._recovering:
-            # Detect unexpected stream death (e.g. SoundGrid driver reset, ASIO
-            # silent hang). Reset and try again in 2 s.
-            if not self._audio.stream_active or self._audio.callback_stalled:
-                self._recovering = True
-                self._last_signal_ok = None
-                self._audio.stop()
-                self._ltc_status.config(text="● Driver reset — restarting…", fg=_FG_WARN)
-                self._tc_label.config(fg=_TC_OFF)
+        """Main thread, ~25 Hz. Drains the timecode queue through the engine
+        (which is what actually fires cues), updates the TC display, and
+        polls the audio capture for signal status + stream health.
+
+        When the UI is hidden in the tray we still pump the engine (cues
+        MUST keep firing) but skip widget mutations — tk wouldn't draw them
+        anyway and skipping saves a handful of Tcl calls per tick."""
+        if self.ctl.running and not self.ctl.recovering:
+            # Detect unexpected stream death.
+            if not self.ctl.audio.stream_active or self.ctl.audio.callback_stalled:
+                self.ctl.set_recovering(True)
+                try:
+                    self.ctl.audio.stop()
+                except Exception:
+                    pass
+                if not self._ui_hidden:
+                    self._ltc_status.config(text="● Driver reset — restarting…", fg=_FG_WARN)
+                    self._tc_label.config(fg=_TC_OFF)
                 self.root.after(2000, self._auto_restart)
                 self.root.after(40, self._poll_queue)
                 return
 
-            latest: Optional[Timecode] = None
-            try:
-                while True:
-                    tc = self._tc_queue.get_nowait()
-                    self._engine.on_timecode(tc)
-                    self._engine.set_fps(tc.fps)
-                    latest = tc
-            except queue.Empty:
-                pass
+            latest = self.ctl.drain_tc_queue()
 
-            if latest is not None:
-                self._current_tc = latest
+            if latest is not None and not self._ui_hidden:
                 self._tc_label.config(text=str(latest))
-                self._last_tc_time = 0
-                fps = self._audio.detected_fps
+                fps = self.ctl.audio.detected_fps
                 if fps:
                     self._fps_label.config(text=f"{fps:.2f} fps".rstrip("0").rstrip("."),
                                             fg=_FG_HEAD)
+            if latest is not None:
+                self._last_tc_time = 0
 
             self._last_tc_time += 1
-            # Three distinct states for the LTC pipeline:
-            #   - locked         → decoder is producing frames (true "LTC OK")
-            #   - signal present → audio above noise floor BUT no LTC pattern
-            #                       (wrong channel, wrong sample rate, garbage)
-            #   - no signal      → audio input silent for >1 s
-            locked = self._audio.is_locked
-            signal_ok = self._audio.signal_present
+            locked = self.ctl.audio.is_locked
+            signal_ok = self.ctl.audio.signal_present
             if locked:
                 new_state = "LOCKED"
             elif signal_ok:
@@ -1444,99 +1348,134 @@ class MainWindow:
             elif self._last_tc_time > 25:
                 new_state = "NO_SIGNAL"
             else:
-                new_state = None  # still in waiting-for-first-frame grace period
+                new_state = None
 
-            if new_state and new_state != self._last_signal_ok:
-                self._last_signal_ok = new_state
-                if new_state == "LOCKED":
-                    self._ltc_status.config(text="● LTC OK", fg=_FG_OK)
-                    self._tc_label.config(fg=_TC_ON)
-                elif new_state == "AUDIO_NOT_LTC":
-                    self._ltc_status.config(
-                        text="● Audio present but no LTC (wrong channel / SR?)",
-                        fg=_FG_WARN,
-                    )
-                    self._tc_label.config(fg=_TC_OFF)
-                else:  # NO_SIGNAL
-                    self._tc_label.config(fg=_TC_OFF)
-                    self._ltc_status.config(text="● No signal", fg=_FG_ERR)
+            if new_state is not None and self.ctl.update_signal_state(new_state):
+                # Signal state change is observable via the web remote even
+                # when the tk UI is hidden, so we always update the
+                # controller; only the desktop widgets are skipped.
+                if not self._ui_hidden:
+                    self._render_signal_state(new_state)
 
         self.root.after(40, self._poll_queue)   # 40 ms ≈ 25 Hz
 
+    def _render_signal_state(self, new_state: str) -> None:
+        if new_state == "LOCKED":
+            self._ltc_status.config(text="● LTC OK", fg=_FG_OK)
+            self._tc_label.config(fg=_TC_ON)
+        elif new_state == "AUDIO_NOT_LTC":
+            self._ltc_status.config(
+                text="● Audio present but no LTC (wrong channel / SR?)",
+                fg=_FG_WARN,
+            )
+            self._tc_label.config(fg=_TC_OFF)
+        else:  # NO_SIGNAL
+            self._tc_label.config(fg=_TC_OFF)
+            self._ltc_status.config(text="● No signal", fg=_FG_ERR)
+
+    def _render_tc_from_event(self, payload: Dict[str, Any]) -> None:
+        # The poll loop already updated _tc_label/_fps_label for tk efficiency.
+        # This handler exists so web/non-tk subscribers still get a clean event.
+        # We leave the UI labels alone here to avoid double-painting.
+        pass
+
     def _auto_restart(self) -> None:
-        """Re-arm the audio capture after a detected driver reset."""
-        if not self._running:
-            self._recovering = False
+        if not self.ctl.running:
+            self.ctl.set_recovering(False)
             return
         try:
-            self._audio.start()
-            self._recovering = False
+            self.ctl.audio.start()
+            self.ctl.set_recovering(False)
             self._ltc_status.config(text="● Restarted — waiting for signal",
                                     fg=_FG_WARN)
         except Exception as exc:  # noqa: BLE001
-            # Try again in 2 s — driver may still be busy
             self._ltc_status.config(text=f"● Restart failed: {exc}", fg=_FG_ERR)
             self.root.after(2000, self._auto_restart)
 
-    # === Engine callbacks ===================================================
+    # === Engine fire rendering ==============================================
 
-    def _on_cue_fired(self, cue: Cue) -> None:
-        self._refresh_tree()
-        # Two-line fire indicator: scene that was recalled + timing info.
-        # Persists in the LV1 STATUS column until the next fire — catalog
-        # updates etc. no longer wipe it.
-        cur = str(self._current_tc) if self._current_tc else "??:??:??:??"
+    def _render_last_fire(self, payload: Dict[str, Any]) -> None:
         self._last_fire_label.config(
             text=(
-                f"[{cue.scene_index}] {cue.scene_name or cue.label}\n"
-                f"target {cue.timecode}  fired @ {cur}"
+                f"[{payload.get('scene_index')}] "
+                f"{payload.get('scene_name') or ''}\n"
+                f"target {payload.get('target_tc')}  fired @ {payload.get('fired_tc')}"
             ),
             fg=_FG_OK,
         )
-
-    def _on_cue_skipped(self, cue: Cue, reason: str) -> None:
-        self._set_status(f"Skipped '{cue.label}': {reason}", warn=True)
-
-    def _on_send_error(self, msg: str) -> None:
-        self._set_status(f"LV1 send error: {msg}", warn=True)
 
     # === File ops ===========================================================
 
     def _new_list(self) -> None:
         if not self._confirm_discard_changes("Start a new cue list?"):
             return
-        self._cue_list = CueList()
-        self._current_file = None
-        self._engine.load_cue_list(self._cue_list)
-        self._refresh_tree()
-        self._clear_dirty()
+        self.ctl.new_cue_list()
 
     def _open_list(self) -> None:
         if not self._confirm_discard_changes("Open a different cue list?"):
             return
         path = filedialog.askopenfilename(
             title="Open cue list",
-            filetypes=[("JSON cue lists", "*.json"), ("All files", "*.*")],
+            initialdir=self._dialog_initial_dir(),
+            filetypes=[
+                (CUE_FILE_DESCRIPTION, f"*{CUE_FILE_EXTENSION}"),
+                ("JSON cue lists (legacy)", "*.json"),
+                ("All files", "*.*"),
+            ],
         )
         if not path:
             return
         self._load_cue_file(path)
 
-    def _load_cue_file(self, path: str) -> None:
-        try:
-            was_midi = CueList.was_migrated_from_midi(path)
-            cl = CueList.load(path)
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Open", f"Failed to load:\n{exc}")
+    def _open_recent(self, path: str) -> None:
+        """File ▸ Open recent ▸ <entry> handler."""
+        if not self._confirm_discard_changes("Open a different cue list?"):
             return
-        self._cue_list = cl
-        self._current_file = path
-        self.settings.last_cue_file = path
-        self._engine.load_cue_list(self._cue_list)
-        if self._scene_catalog:
-            self._engine.resolve_against_catalog(self._scene_catalog)
-        self._refresh_tree()
-        self._clear_dirty()
+        if not os.path.isfile(path):
+            messagebox.showerror(
+                "Open recent",
+                f"File no longer exists:\n  {path}\n\nRemoving from the recent list.",
+            )
+            self.ctl._prune_recent(path)
+            return
+        self._load_cue_file(path)
+
+    def _rebuild_recent_menu(self) -> None:
+        """Wipe + repopulate the Open Recent submenu from controller state.
+        Stale entries (file no longer exists) are kept but rendered as
+        disabled so the operator sees they used to be there."""
+        m = getattr(self, "_recent_menu", None)
+        if m is None:
+            return
+        try:
+            m.delete(0, "end")
+        except tk.TclError:
+            return
+        entries = self.ctl._recent_files_payload()
+        if not entries:
+            m.add_command(label="(no recent files)", state="disabled")
+            return
+        for i, e in enumerate(entries, start=1):
+            label = f"{i}. {e['name']}    —    {e['path']}"
+            if e["exists"]:
+                m.add_command(label=label, command=lambda p=e["path"]: self._open_recent(p))
+            else:
+                m.add_command(label=f"{label}    (missing)", state="disabled")
+        m.add_separator()
+        m.add_command(label="Clear recent files", command=self.ctl.clear_recent)
+
+    def _dialog_initial_dir(self) -> str:
+        """Where Save/Open dialogs should land first time. Prefer the current
+        file's folder, fall back to ~/Documents/LTCtoLV1 (created if missing)."""
+        if self.ctl.current_file and os.path.isdir(os.path.dirname(self.ctl.current_file)):
+            return os.path.dirname(self.ctl.current_file)
+        return ensure_projects_dir()
+
+    def _load_cue_file(self, path: str) -> None:
+        ok, err, was_midi = self.ctl.load_cue_file(path)
+        if not ok:
+            messagebox.showerror("Open", f"Failed to load:\n{err}")
+            return
         if was_midi:
             messagebox.showinfo(
                 "Imported from MIDI",
@@ -1547,35 +1486,33 @@ class MainWindow:
                 f"Open each cue with Edit and pick the scene from the dropdown, "
                 f"then Save the list — it will be saved in the new format.",
             )
-            # Reset validated_once so the warning fires after the next catalog load
             self._validated_once = False
-            if self._scene_catalog:
+            if self.ctl.scene_catalog:
                 self._show_validation_warnings()
 
     def _save_list(self) -> None:
-        if self._current_file:
-            self._write_cue_file(self._current_file)
+        if self.ctl.current_file:
+            self._write_cue_file(self.ctl.current_file)
         else:
             self._save_list_as()
 
     def _save_list_as(self) -> None:
         path = filedialog.asksaveasfilename(
             title="Save cue list",
-            defaultextension=".json",
-            filetypes=[("JSON cue lists", "*.json")],
+            initialdir=self._dialog_initial_dir(),
+            defaultextension=CUE_FILE_EXTENSION,
+            filetypes=[
+                (CUE_FILE_DESCRIPTION, f"*{CUE_FILE_EXTENSION}"),
+                ("JSON cue lists (legacy)", "*.json"),
+            ],
         )
         if path:
             self._write_cue_file(path)
-            self._current_file = path
-            self.settings.last_cue_file = path
 
     def _write_cue_file(self, path: str) -> None:
-        try:
-            self._cue_list.save(path)
-            self._set_status(f"Saved: {os.path.basename(path)}")
-            self._clear_dirty()
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Save", f"Failed to save:\n{exc}")
+        ok, err = self.ctl.save_cue_file(path)
+        if not ok:
+            messagebox.showerror("Save", f"Failed to save:\n{err}")
 
     # === Misc ===============================================================
 
@@ -1584,27 +1521,13 @@ class MainWindow:
             t = int(self._tol_var.get())
         except ValueError:
             return
-        self._engine.tolerance_frames = t
-        self.settings.tolerance_frames = t
+        self.ctl.set_tolerance(t)
 
     def _update_dry_run(self) -> None:
-        v = self._dry_var.get()
-        self._engine.dry_run = v
-        self.settings.dry_run = v
-        self._set_status("Dry-run ON" if v else "Dry-run OFF")
+        self.ctl.set_dry_run(self._dry_var.get())
 
-    def _set_status(self, text: str, warn: bool = False) -> None:
+    def _set_status_label(self, text: str, warn: bool) -> None:
         self._status_label.config(text=text, fg=_FG_WARN if warn else _FG_HEAD)
-
-    def _log(self, level: str, msg: str) -> None:
-        # Only surface warnings/errors in the status bar — info-level logs
-        # (catalog updates, registration confirmations, etc.) would otherwise
-        # clobber the "fired cue" message, hiding what the operator most needs
-        # to see. Info still goes to stdout for debugging.
-        if level in ("warn", "warning", "error"):
-            self._set_status(msg, warn=True)
-        else:
-            print(f"[lv1] {msg}")
 
     def _show_about(self) -> None:
         messagebox.showinfo(
@@ -1612,15 +1535,228 @@ class MainWindow:
             f"LTC to LV1  v{_VERSION}\n\n"
             "Reads SMPTE LTC from an audio input and recalls Waves LV1\n"
             "snapshots over OSC at frame-accurate timecodes.\n\n"
+            "Includes a built-in web remote — see File ▸ Web remote settings.\n\n"
             "MIT licensed.",
         )
+
+    # === Web remote =========================================================
+
+    def _show_web_settings(self) -> None:
+        WebSettingsDialog(self.root, self.ctl)
+
+    def _open_web_remote(self) -> None:
+        if not getattr(self.settings, "web_enabled", False):
+            messagebox.showinfo(
+                "Web remote",
+                "The web remote is currently disabled.\n\n"
+                "Enable it in File ▸ Web remote settings.",
+            )
+            return
+        port = int(getattr(self.settings, "web_port", 8080))
+        webbrowser.open(f"http://127.0.0.1:{port}/")
+
+    # === Tray integration ===================================================
+
+    def _minimize_to_tray(self) -> None:
+        """Hide the desktop window. The engine + web remote keep running.
+        The tray icon (if available) is the way back."""
+        try:
+            self.root.withdraw()
+        except tk.TclError:
+            return
+        self._ui_hidden = True
+        if self._tray is None:
+            # No tray running — surface a hint so the operator knows how to
+            # bring the window back (Alt-Tab is fine but not obvious).
+            self.ctl.set_status(
+                "Window hidden. No tray icon — pass --start-minimized off, "
+                "or use the web remote's 'Open UI' button.",
+                warn=True,
+            )
+
+    def _show_and_focus(self) -> None:
+        """Bring the desktop window back from the tray AND to the front,
+        even past fullscreen apps when possible. Called from:
+          - tray menu 'Open UI'
+          - web remote 'Open UI' button (via /api/window/show)"""
+        try:
+            self.root.deiconify()
+            # state('normal') un-minimises if it was iconified rather than
+            # withdrawn (e.g. classic taskbar minimise).
+            try:
+                self.root.state("normal")
+            except tk.TclError:
+                pass
+            # The topmost-flicker trick is the documented Tk workaround for
+            # Windows' focus-stealing-prevention. Setting topmost briefly
+            # forces the window above the foreground; we drop it back so
+            # the user can still cover it with other apps afterwards.
+            self.root.lift()
+            try:
+                self.root.attributes("-topmost", True)
+                self.root.after(250, lambda: self._safe_topmost_off())
+            except tk.TclError:
+                pass
+            try:
+                self.root.focus_force()
+            except tk.TclError:
+                pass
+            # On Windows, also call SetForegroundWindow via ctypes — pure-Tk
+            # lift() doesn't always win the focus race against a fullscreen
+            # foreground process (e.g. the LV1 mix app).
+            if sys.platform == "win32":
+                self._win32_force_foreground()
+        finally:
+            was_hidden = self._ui_hidden
+            self._ui_hidden = False
+            # While hidden the poll loop and dispatcher skipped widget
+            # mutations to save Tcl calls. The controller's state moved on
+            # though — TC, signal, scene catalog, last fire, cues, LV1
+            # connection — and the widgets still show whatever they were
+            # last painted with before the minimise. Force a full repaint
+            # from the current controller snapshot so the UI reflects
+            # reality immediately, instead of slowly catching up only on
+            # the next event-per-field.
+            if was_hidden:
+                self._repaint_from_controller_state()
+
+    def _repaint_from_controller_state(self) -> None:
+        """Re-sync every desktop widget with the controller's current state.
+        Used after returning from the tray, where the dispatcher's
+        memoised "no change since last paint" assumption no longer holds."""
+        snap = self.ctl.snapshot()
+
+        # Running / transport — repaint the START/STOP button and signal
+        # status banner before we touch the TC text below.
+        self._render_running_from_event({
+            "running": snap.get("running"),
+            "recovering": snap.get("recovering"),
+            "signal": snap.get("signal"),
+        })
+
+        # TC + FPS display
+        cur_tc = snap.get("current_tc")
+        if cur_tc:
+            self._tc_label.config(text=cur_tc)
+        fps = snap.get("fps")
+        if fps:
+            self._fps_label.config(
+                text=f"{fps:.2f} fps".rstrip("0").rstrip("."),
+                fg=_FG_HEAD,
+            )
+
+        # Signal state — bypass the memoisation in update_signal_state so
+        # the TC label colour gets re-applied even if the state hasn't
+        # actually changed since before the minimise.
+        sig = snap.get("signal")
+        if sig:
+            self._render_signal_state(sig)
+
+        # LV1 connection + current scene + last fire
+        lv1 = snap.get("lv1") or {}
+        if lv1:
+            self._render_lv1_state_from_event(lv1)
+        idx = snap.get("lv1_current_scene")
+        if idx is None:
+            self._cur_scene_label.config(text="—", fg=_FG_DIM)
+        else:
+            name = snap.get("lv1_current_scene_name") or "(unknown)"
+            self._cur_scene_label.config(text=f"[{idx}] {name}", fg=_FG_OK)
+        if snap.get("last_fire"):
+            self._render_last_fire(snap["last_fire"])
+
+        # Cues + scene catalog tables
+        self._refresh_tree()
+        self._refresh_catalog_tree()
+        self._update_file_label()
+
+        # Status bar
+        ls = snap.get("last_status")
+        if ls:
+            self._set_status_label(ls.get("text", ""), bool(ls.get("warn")))
+
+    def _safe_topmost_off(self) -> None:
+        try:
+            self.root.attributes("-topmost", False)
+        except tk.TclError:
+            pass
+
+    def _win32_force_foreground(self) -> None:
+        try:
+            import ctypes
+            hwnd = self.root.winfo_id()
+            # Some Tk builds return the inner draw HWND; walking up to the
+            # owner window via GetAncestor(GA_ROOT) gets us the actual
+            # top-level so SetForegroundWindow targets it.
+            GA_ROOT = 2
+            user32 = ctypes.windll.user32
+            root_hwnd = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+            user32.ShowWindow(root_hwnd, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(root_hwnd)
+        except Exception:
+            pass
+
+    def _quit_from_tray(self) -> None:
+        """Tray 'Quit' handler. Skips the unsaved-changes prompt unless the
+        window is visible (operator can't see the dialog from the tray)."""
+        if not self._ui_hidden:
+            self._on_close()
+            return
+        # Quietly tear down — saving any in-flight changes would risk
+        # corrupting a file the user hasn't reviewed.
+        self._shutting_down = True
+        try:
+            self._unsub()
+        except Exception:
+            pass
+        try:
+            self.ctl.shutdown()
+        except Exception:
+            pass
+        try:
+            self.ctl.save_settings()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    # === File type association ==============================================
+
+    def _associate_file_type(self) -> None:
+        """Register the .ltcv1 extension so double-click on a cue list file
+        opens this app. Per-user (HKCU) — no admin required, no UAC prompt."""
+        try:
+            import file_assoc
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Associate", f"Couldn't load file_assoc:\n{exc}")
+            return
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo(
+                "Associate",
+                "File association only works for the built .exe.\n"
+                "Build the app with PyInstaller (release.bat) before "
+                "registering the file type.",
+            )
+            return
+        if file_assoc.register():
+            messagebox.showinfo(
+                "Associate",
+                f"{CUE_FILE_EXTENSION} files will now open in LTCtoLV1.\n\n"
+                "If Explorer still shows the old icon, restart it from "
+                "Task Manager (or sign out and back in).",
+            )
+        else:
+            messagebox.showerror(
+                "Associate",
+                "Couldn't write the file association.\n"
+                "Try running the app once as Administrator if the problem persists.",
+            )
 
     # === Update check =======================================================
 
     def _check_updates(self, silent_if_ok: bool = False) -> None:
-        """Hit the GitHub releases API and offer to open the page if a newer
-        tag is available. Runs on a background thread; the UI prompt is
-        marshalled back to the main thread."""
         def _worker() -> None:
             try:
                 req = urllib.request.Request(
@@ -1670,30 +1806,271 @@ class MainWindow:
             webbrowser.open(latest_url)
 
     def _on_close(self) -> None:
-        # Ask to save first if the cue list has unsaved changes
         if not self._confirm_discard_changes("Quit without saving?"):
             return
+        # Unsubscribe FIRST so the wind-down (stop_capture, lv1.disconnect)
+        # doesn't schedule any more after_idle callbacks against widgets that
+        # are about to be destroyed.
+        self._shutting_down = True
         try:
-            self._stop()
+            self._unsub()
         except Exception:
             pass
         try:
-            self._lv1.disconnect()
+            self.ctl.shutdown()
         except Exception:
             pass
         try:
-            self.settings.save()
+            self.ctl.save_settings()
         except Exception:
             pass
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+
+# --- Web settings dialog ----------------------------------------------------
+
+
+class WebSettingsDialog(tk.Toplevel):
+    """Tiny modal to toggle the web remote, change its port, and surface the
+    LAN URLs that operators can hand off to phones / tablets. The LV1 host
+    typically has at least two NICs (control + soundgrid), so we list every
+    routable IPv4 we can detect, ranked by likelihood."""
+
+    def __init__(self, parent: tk.Tk, ctl: AppController) -> None:
+        super().__init__(parent)
+        self.title("Web remote settings")
+        self.configure(bg=_BG)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self._parent = parent
+        self._ctl = ctl
+        self._cached_ips: Optional[List[str]] = None
+        self._destroyed: bool = False
+        # Centre on the parent window — Toplevel defaults to (0,0), which on
+        # multi-monitor / large-window setups lands in the corner away from
+        # where the operator is actually looking. Defer until after the body
+        # is built so the size is known.
+        self.after_idle(self._center_on_parent)
+
+        body = tk.Frame(self, bg=_BG_PAN, padx=16, pady=14,
+                        highlightthickness=1, highlightbackground=_BORDER)
+        body.pack(padx=10, pady=10)
+
+        tk.Label(
+            body,
+            text=(
+                "The web remote lets you control LTCtoLV1 from any browser\n"
+                "on the same network — phone, tablet, or another laptop."
+            ),
+            bg=_BG_PAN, fg=_FG, font=_F_UI, justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        self._enabled_var = tk.BooleanVar(value=bool(getattr(ctl.settings, "web_enabled", False)))
+        ttk.Checkbutton(body, text="Enable web remote on app start",
+                        variable=self._enabled_var).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=2
+        )
+
+        # System integration toggles. Autostart only does anything for the
+        # frozen .exe / .app — for source runs we still let the user toggle
+        # it but the action quietly no-ops.
+        self._tray_var = tk.BooleanVar(value=bool(getattr(ctl.settings, "tray_enabled", True)))
+        ttk.Checkbutton(body, text="Show system-tray icon (takes effect after restart)",
+                        variable=self._tray_var).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=2
+        )
+        self._autostart_var = tk.BooleanVar(value=bool(getattr(ctl.settings, "autostart_enabled", False)))
+        ttk.Checkbutton(body, text="Start automatically on login (hidden in tray)",
+                        variable=self._autostart_var).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=2
+        )
+
+        tk.Label(body, text="Port:", bg=_BG_PAN, fg=_FG_HEAD,
+                 font=_F_UI).grid(row=4, column=0, sticky="w", pady=(8, 2))
+        self._port_var = tk.StringVar(value=str(getattr(ctl.settings, "web_port", 8080)))
+        tk.Entry(body, textvariable=self._port_var, width=8, font=_F_UI,
+                 bg=_BG_WID, fg=_FG, insertbackground=_FG,
+                 highlightthickness=0).grid(row=4, column=1, sticky="w", pady=(8, 2))
+        # Live-refresh the URL list when the operator types a different port.
+        self._port_var.trace_add("write", lambda *_: self._refresh_urls())
+
+        # LAN URL list — populated asynchronously since _local_ipv4s() can do
+        # subprocess calls (ipconfig / ifconfig) that take ~hundreds of ms.
+        tk.Label(body, text="Open from a phone or tablet on the LAN:",
+                 bg=_BG_PAN, fg=_FG_HEAD, font=_F_UI, justify="left").grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(12, 2)
+        )
+        self._urls_frame = tk.Frame(body, bg=_BG_PAN)
+        self._urls_frame.grid(row=6, column=0, columnspan=2, sticky="w",
+                              pady=(0, 4))
+        self._urls_placeholder = tk.Label(
+            self._urls_frame,
+            text="Detecting LAN addresses…",
+            bg=_BG_PAN, fg=_FG_DIM, font=_F_MONO,
+        )
+        self._urls_placeholder.pack(anchor="w")
+
+        info = (
+            "Changes to the port take effect after restarting the app.\n"
+            "The remote binds to 0.0.0.0 (open to anyone on the LAN)."
+        )
+        tk.Label(body, text=info, bg=_BG_PAN, fg=_FG_DIM, font=_F_UI,
+                 justify="left").grid(row=7, column=0, columnspan=2,
+                                       sticky="w", pady=(8, 0))
+
+        btns = tk.Frame(body, bg=_BG_PAN)
+        btns.grid(row=8, column=0, columnspan=2, pady=(14, 0))
+        _btn(btns, "Save", self._ok, bg=_GO_BG, abg=_GO_ABG, fg="#FFFFFF",
+             width=8, px=14, py=5).pack(side="left", padx=4)
+        _btn(btns, "Cancel", self.destroy, width=8, px=14, py=5).pack(side="left", padx=4)
+
+        self.bind("<Return>", lambda _e: self._ok())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.protocol("WM_DELETE_WINDOW", self._on_destroy)
+
+        # Kick off IP detection on a worker thread.
+        threading.Thread(
+            target=self._fetch_ips, name="WebSettingsDetectIPs", daemon=True
+        ).start()
+
+    def _on_destroy(self) -> None:
+        self._destroyed = True
+        self.destroy()
+
+    def _center_on_parent(self) -> None:
+        """Position the dialog over the middle of the parent window. Safe to
+        call after destroy — bails on TclError."""
+        try:
+            self.update_idletasks()
+            w = self.winfo_width()
+            h = self.winfo_height()
+            p = self._parent
+            pw = p.winfo_width()
+            ph = p.winfo_height()
+            px = p.winfo_rootx()
+            py = p.winfo_rooty()
+            x = max(0, px + (pw - w) // 2)
+            y = max(0, py + (ph - h) // 2)
+            self.geometry(f"+{x}+{y}")
+        except tk.TclError:
+            pass
+
+    def _fetch_ips(self) -> None:
+        """Worker thread — runs the (possibly slow) subprocess-backed IP scan,
+        then marshals the result back to the tk main loop."""
+        try:
+            from zdns_discover import _local_ipv4s, _rank_ip
+            ips = _local_ipv4s()
+            # Rank best-first so the most reachable URL is on top of the list.
+            ips = sorted(set(ips), key=_rank_ip, reverse=True)
+        except Exception:
+            ips = []
+        if self._destroyed:
+            return
+        try:
+            self.after_idle(lambda: self._render_ips(ips))
+        except tk.TclError:
+            pass
+
+    def _render_ips(self, ips: List[str]) -> None:
+        if self._destroyed or not self._urls_frame.winfo_exists():
+            return
+        self._cached_ips = ips
+        self._refresh_urls()
+
+    def _refresh_urls(self) -> None:
+        """Re-paint the URL list whenever the IP cache or port changes."""
+        if self._destroyed or not self._urls_frame.winfo_exists():
+            return
+        # Drop the placeholder + any prior rows.
+        for w in self._urls_frame.winfo_children():
+            w.destroy()
+        ips = self._cached_ips
+        if ips is None:
+            tk.Label(self._urls_frame, text="Detecting LAN addresses…",
+                     bg=_BG_PAN, fg=_FG_DIM, font=_F_MONO).pack(anchor="w")
+            return
+        if not ips:
+            tk.Label(self._urls_frame,
+                     text="(no LAN addresses detected — check NIC config)",
+                     bg=_BG_PAN, fg=_FG_WARN, font=_F_UI).pack(anchor="w")
+            return
+        try:
+            port = int(self._port_var.get().strip() or "8080")
+        except ValueError:
+            port = 0
+        if port < 1 or port > 65535:
+            tk.Label(self._urls_frame,
+                     text="(enter a valid port to see URLs)",
+                     bg=_BG_PAN, fg=_FG_DIM, font=_F_UI).pack(anchor="w")
+            return
+
+        for ip in ips:
+            url = f"http://{ip}:{port}/"
+            row = tk.Frame(self._urls_frame, bg=_BG_PAN)
+            row.pack(fill="x", anchor="w")
+            tk.Label(row, text=url, bg=_BG_PAN, fg=_FG, font=_F_MONO).pack(side="left")
+            _btn(row, "Copy", lambda u=url: self._copy(u),
+                 width=4, px=6, py=0).pack(side="left", padx=(8, 0))
+
+    def _copy(self, text: str) -> None:
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update()  # ensure clipboard is owned even after window closes
+        except tk.TclError:
+            pass
+
+    def _ok(self) -> None:
+        try:
+            port = int(self._port_var.get().strip() or "8080")
+            if port < 1 or port > 65535:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid", "Port must be a number 1–65535.",
+                                 parent=self)
+            return
+        autostart_on = bool(self._autostart_var.get())
+        self._ctl.update_settings(
+            web_enabled=bool(self._enabled_var.get()),
+            web_port=port,
+            tray_enabled=bool(self._tray_var.get()),
+            autostart_enabled=autostart_on,
+        )
+        self._ctl.save_settings()
+        # Apply autostart immediately — registering/unregistering is cheap and
+        # the user reasonably expects the change to take effect right now.
+        try:
+            import autostart
+            if autostart.is_supported():
+                if autostart_on:
+                    if not autostart.enable(start_minimized=True):
+                        messagebox.showwarning(
+                            "Autostart",
+                            "Autostart only registers from the built app.\n"
+                            "It will activate after you next launch the .exe / .app.",
+                            parent=self,
+                        )
+                else:
+                    autostart.disable()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showwarning(
+                "Autostart",
+                f"Couldn't update autostart:\n{exc}",
+                parent=self,
+            )
+        self._destroyed = True
+        self.destroy()
 
 
 # --- Module-level helpers ---------------------------------------------------
 
 
 def _version_tuple(v: str) -> tuple:
-    """Parse 'X.Y.Z' into (X, Y, Z) for comparison. Non-numeric segments
-    become 0 so they sort lower than any real number."""
     out = []
     for part in v.strip().lstrip("v").split("."):
         try:
