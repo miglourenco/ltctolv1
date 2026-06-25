@@ -260,7 +260,19 @@ def _local_ipv4s() -> List[str]:
     # 5: Platform-specific subprocess fallback
     import subprocess
     if sys.platform == "win32":
-        # ipconfig — match every IPv4 in the output (locale-independent)
+        # ipconfig output contains the local IPv4 AND the subnet mask, default
+        # gateway, DHCP server, DNS servers — ALL in the same "label : value"
+        # shape. The original regex matched every IPv4 in the output, which
+        # incorrectly pulled in the gateway (and DNS) IPs as if they were
+        # ours. Parse line-by-line and skip rows whose label looks like a
+        # non-host field. Keywords cover EN / PT / ES / FR / DE / IT builds;
+        # other locales fall through to the generic IP-shape sanity check.
+        _SKIP_LABEL_KEYWORDS = (
+            "mask", "máscara", "maschera", "maske",
+            "gateway", "passerelle", "puerta", "predeterminado",
+            "dhcp", "dns", "lease", "concessão", "concession",
+            "wins", "duid",
+        )
         try:
             res = subprocess.run(
                 ["ipconfig"],
@@ -268,9 +280,18 @@ def _local_ipv4s() -> List[str]:
                 text=True,
                 timeout=3.0,
             )
-            for m in re.finditer(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b", res.stdout):
+            for line in res.stdout.splitlines():
+                if ":" not in line:
+                    continue
+                label, _, value = line.partition(":")
+                ll = label.strip().lower()
+                if any(k in ll for k in _SKIP_LABEL_KEYWORDS):
+                    continue
+                m = re.search(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b", value)
+                if not m:
+                    continue
                 ip = m.group(1)
-                if ip.startswith("255.") or ip == "0.0.0.0":
+                if ip.startswith("255.") or ip == "0.0.0.0" or ip.endswith(".255"):
                     continue
                 _add(ip)
         except Exception:

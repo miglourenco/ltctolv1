@@ -26,18 +26,35 @@ _certifi_datas = collect_data_files('certifi')
 _ico_src = [('ltctolv1.ico', '.')] if os.path.exists('ltctolv1.ico') else []
 _ico_path = 'ltctolv1.ico' if os.path.exists('ltctolv1.ico') else None
 
+# ── web remote: bundle the entire web/ tree (index.html + static/*) ──────────
+# WebServer reads from sys._MEIPASS/web at runtime when frozen.
+_web_datas = []
+if os.path.isdir('web'):
+    for root, _dirs, files in os.walk('web'):
+        for f in files:
+            src = os.path.join(root, f)
+            dest = os.path.dirname(src)  # preserve relative directory layout
+            _web_datas.append((src, dest))
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 a = Analysis(
     ['main.py'],
     pathex=['.'],
     binaries=_sd_bins + _np_bins,
-    datas=_sd_datas + _np_datas + _certifi_datas + _ico_src,
+    datas=_sd_datas + _np_datas + _certifi_datas + _ico_src + _web_datas,
     hiddenimports=_np_hidden + [
         'sounddevice',
         'certifi',
         'ctypes',
         'ctypes.wintypes',
+        'flask',
+        'werkzeug',
+        'werkzeug.serving',
+        'pystray',
+        'pystray._win32',
+        'PIL',
+        'PIL.Image',
     ],
     hookspath=[],
     hooksconfig={},

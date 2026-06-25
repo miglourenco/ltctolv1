@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1E1E1E">
+  <title>LTC to LV1 — Remote</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <div class="hdr-left">
+      <span class="brand">LTC → LV1</span>
+      <span class="version" id="version">v—</span>
+    </div>
+    <div class="hdr-right">
+      <button id="btn-show-ui" class="pill" title="Bring the desktop UI to the front of the host">Open UI</button>
+      <button id="btn-run"   class="pill go">▶ START</button>
+      <button id="btn-lv1"   class="pill stop">● OFFLINE</button>
+    </div>
+  </header>
+
+  <section id="tc-panel">
+    <div class="tc" id="tc">00:00:00:00</div>
+    <div class="tc-row">
+      <span id="ltc-status" class="ltc-status">● Stopped</span>
+      <span id="fps" class="fps">-- fps</span>
+    </div>
+  </section>
+
+  <section id="status-panel">
+    <div class="status-block">
+      <div class="status-head">LV1 STATUS</div>
+      <div class="status-body mono" id="lv1-status">Disconnected</div>
+    </div>
+    <div class="status-block">
+      <div class="status-head">CURRENT SCENE</div>
+      <div class="status-body mono" id="lv1-current">—</div>
+    </div>
+    <div class="status-block">
+      <div class="status-head">LAST FIRE</div>
+      <div class="status-body mono" id="last-fire">—</div>
+    </div>
+  </section>
+
+  <nav id="tabs">
+    <button class="tab active" data-tab="cues">Cues</button>
+    <button class="tab"        data-tab="scenes">Scenes</button>
+    <button class="tab"        data-tab="settings">Settings</button>
+  </nav>
+
+  <main>
+    <!-- ─── Cues tab ────────────────────────────────────────────────── -->
+    <section id="tab-cues" class="tab-panel active">
+      <div class="toolbar">
+        <button id="btn-tap" class="btn">Quick Add +</button>
+        <button id="btn-add" class="btn">+ Add</button>
+        <button id="btn-reset" class="btn">↺ Reset</button>
+        <button id="btn-revalidate" class="btn">Re-validate</button>
+        <span class="spacer"></span>
+        <span class="file-name" id="file-name">(unsaved)</span>
+        <select id="recent-select" class="btn" title="Open a recent cue list">
+          <option value="">Recent ▾</option>
+        </select>
+        <button id="btn-save" class="btn">Save</button>
+        <button id="btn-download" class="btn">Download</button>
+        <label class="btn upload">
+          Upload<input type="file" id="upload-input" accept="application/json,.ltcv1" hidden>
+        </label>
+        <button id="btn-new" class="btn">New</button>
+      </div>
+      <div class="cues-list" id="cues-list">
+        <div class="empty">No cues yet — add one above, or load a list.</div>
+      </div>
+    </section>
+
+    <!-- ─── Scenes tab ──────────────────────────────────────────────── -->
+    <section id="tab-scenes" class="tab-panel">
+      <div class="hint">Double-tap a scene to recall it on the LV1. To assign a scene to a cue, open the cue (Cues tab) and use ↔ Assign scene.</div>
+      <div class="scenes-list" id="scenes-list">
+        <div class="empty">Connect to an LV1 to see its scene catalog.</div>
+      </div>
+    </section>
+
+    <!-- ─── Settings tab ────────────────────────────────────────────── -->
+    <section id="tab-settings" class="tab-panel">
+      <div class="settings-group">
+        <h3>LV1 connection</h3>
+        <div class="form-row">
+          <button id="btn-discover" class="btn">↺ Discover</button>
+          <select id="discovered-select" class="grow"></select>
+        </div>
+        <div class="form-row">
+          <label>Host</label>
+          <input id="lv1-host" type="text" placeholder="e.g. 192.168.1.10">
+          <label>Port</label>
+          <input id="lv1-port" type="number" min="0" max="65535" style="width: 7em">
+          <button id="btn-connect" class="btn">Connect</button>
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <h3>Audio capture</h3>
+        <div class="form-row">
+          <label>Device</label>
+          <select id="audio-select" class="grow"></select>
+          <button id="btn-audio-refresh" class="btn small">↺</button>
+        </div>
+        <div class="form-row">
+          <label>Channel</label>
+          <select id="channel-select"></select>
+          <label class="checkbox">
+            <input type="checkbox" id="sr-force"> SR force
+          </label>
+          <select id="sr-select">
+            <option>44100</option><option selected>48000</option><option>96000</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>Buffer</label>
+          <select id="block-select">
+            <option>64</option><option>128</option><option>256</option>
+            <option selected>512</option><option>1024</option><option>2048</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <h3>Engine</h3>
+        <div class="form-row">
+          <label>Frame tolerance ±</label>
+          <input id="tolerance" type="number" min="0" max="10" value="1" style="width: 5em">
+          <label class="checkbox">
+            <input type="checkbox" id="dry-run"> Dry-run (don't send OSC)
+          </label>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer id="status-bar">
+    <span id="status-text"></span>
+    <span id="conn-indicator">●</span>
+  </footer>
+
+  <!-- ─── Modal: cue editor ─────────────────────────────────────────── -->
+  <div id="modal-backdrop" class="hidden">
+    <div id="cue-modal">
+      <h3 id="cue-modal-title">Add cue</h3>
+      <div class="form-row">
+        <label>Timecode</label>
+        <input id="cue-tc" type="text" placeholder="HH:MM:SS:FF" class="mono">
+      </div>
+      <div class="form-row">
+        <label>Label</label>
+        <input id="cue-label" type="text">
+      </div>
+      <div class="form-row">
+        <label>Scene</label>
+        <select id="cue-scene-picker" class="grow"></select>
+      </div>
+      <div class="form-row">
+        <label>Name</label>
+        <input id="cue-scene-name" type="text" class="grow">
+        <label>Index</label>
+        <input id="cue-scene-index" type="number" style="width: 5em">
+      </div>
+      <div class="form-row">
+        <label class="checkbox">
+          <input type="checkbox" id="cue-enabled" checked> Enabled
+        </label>
+      </div>
+      <div class="modal-actions">
+        <button id="cue-modal-cancel" class="btn">Cancel</button>
+        <button id="cue-modal-save" class="btn go">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

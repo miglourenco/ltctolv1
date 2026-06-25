@@ -23,8 +23,71 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional
+
+
+# ── Custom file type ─────────────────────────────────────────────────────────
+# The desktop app registers this extension with the OS so cue list files can
+# be opened by double-click. Content is plain JSON (Cue.from_dict still loads
+# legacy ".json" exports), but giving the file its own extension lets the OS
+# bind it to LTCtoLV1 exclusively.
+CUE_FILE_EXTENSION = ".ltcv1"
+CUE_FILE_DESCRIPTION = "LTCtoLV1 cue list"
+WINDOWS_PROGID = "LTCtoLV1.cuelist"
+
+# Maximum entries kept in AppSettings.recent_files. Older entries are dropped
+# off the bottom; new entries push to the top (most-recent-first).
+RECENT_FILES_MAX = 10
+
+
+def default_projects_dir() -> str:
+    """Where cue list files live by default.
+
+    Windows: %USERPROFILE%\\Documents\\LTCtoLV1
+    macOS:   ~/Documents/LTCtoLV1
+    Linux:   ~/Documents/LTCtoLV1
+
+    On Windows we ask the shell for the *current* Documents path because
+    OneDrive (and corporate group policy) often relocates it from the literal
+    ~/Documents. Falling back to expanduser() if the shell call fails.
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            CSIDL_PERSONAL = 0x0005
+            SHGFP_TYPE_CURRENT = 0
+            buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+            res = ctypes.windll.shell32.SHGetFolderPathW(
+                None, CSIDL_PERSONAL, None, SHGFP_TYPE_CURRENT, buf
+            )
+            base = buf.value if res == 0 and buf.value else os.path.expanduser("~/Documents")
+        except Exception:
+            base = os.path.expanduser("~/Documents")
+    else:
+        base = os.path.expanduser("~/Documents")
+    return os.path.join(base, "LTCtoLV1")
+
+
+def ensure_projects_dir() -> str:
+    """Return default_projects_dir() after best-effort mkdir. Never raises."""
+    path = default_projects_dir()
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
+    return path
+
+
+def _norm(path: str) -> str:
+    """Canonical key for deduping recent-files entries — case-insensitive on
+    Windows, case-sensitive elsewhere."""
+    try:
+        return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    except Exception:
+        return path
 
 
 # --- Cue --------------------------------------------------------------------
@@ -220,6 +283,13 @@ class AppSettings:
     dry_run: bool = False
     # UI state
     last_cue_file: str = ""
+    recent_files: List[str] = field(default_factory=list)
+    # Web remote
+    web_enabled: bool = False
+    web_port: int = 8080
+    # System integration
+    tray_enabled: bool = True           # show a system-tray icon
+    autostart_enabled: bool = False     # launch on user login (starts minimized to tray)
 
     @classmethod
     def load(cls) -> "AppSettings":

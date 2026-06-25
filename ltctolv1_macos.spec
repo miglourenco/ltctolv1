@@ -27,16 +27,32 @@ _certifi_datas = collect_data_files('certifi')
 _icns_src = [('ltctolv1.icns', '.')] if os.path.exists('ltctolv1.icns') else []
 _icns_path = 'ltctolv1.icns' if os.path.exists('ltctolv1.icns') else None
 
+# ── web remote: bundle the entire web/ tree (index.html + static/*) ──────────
+_web_datas = []
+if os.path.isdir('web'):
+    for root, _dirs, files in os.walk('web'):
+        for f in files:
+            src = os.path.join(root, f)
+            dest = os.path.dirname(src)  # preserve relative directory layout
+            _web_datas.append((src, dest))
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 a = Analysis(
     ['main.py'],
     pathex=['.'],
     binaries=_sd_bins + _np_bins,
-    datas=_sd_datas + _np_datas + _certifi_datas + _icns_src,
+    datas=_sd_datas + _np_datas + _certifi_datas + _icns_src + _web_datas,
     hiddenimports=_np_hidden + [
         'sounddevice',
         'certifi',
+        'flask',
+        'werkzeug',
+        'werkzeug.serving',
+        'pystray',
+        'pystray._darwin',
+        'PIL',
+        'PIL.Image',
     ],
     hookspath=[],
     hooksconfig={},
@@ -96,5 +112,31 @@ app = BUNDLE(
         'CFBundleShortVersionString': '1.0.0',
         'CFBundleName': 'LTCtoLV1',
         'NSMicrophoneUsageDescription': 'LTCtoLV1 needs audio input to read LTC timecode.',
+        # Declare ownership of the .ltcv1 file type so the OS sends
+        # double-click + open-with events back to this .app. macOS picks
+        # this up automatically the first time the .app is launched.
+        'CFBundleDocumentTypes': [
+            {
+                'CFBundleTypeName': 'LTCtoLV1 cue list',
+                'CFBundleTypeRole': 'Editor',
+                'LSHandlerRank': 'Owner',
+                'CFBundleTypeExtensions': ['ltcv1'],
+                'CFBundleTypeIconFile': 'ltctolv1.icns',
+                'LSItemContentTypes': ['com.ltctolv1.cuelist'],
+            },
+        ],
+        # Export the UTI so Spotlight / other apps can identify the file type.
+        'UTExportedTypeDeclarations': [
+            {
+                'UTTypeIdentifier': 'com.ltctolv1.cuelist',
+                'UTTypeDescription': 'LTCtoLV1 cue list',
+                'UTTypeConformsTo': ['public.json'],
+                'UTTypeTagSpecification': {
+                    'public.filename-extension': ['ltcv1'],
+                    'public.mime-type': ['application/json'],
+                },
+                'UTTypeIconFile': 'ltctolv1.icns',
+            },
+        ],
     },
 )
