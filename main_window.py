@@ -63,7 +63,7 @@ from scene_resolver import validate_all
 
 # --- Constants --------------------------------------------------------------
 
-_VERSION = "2.0.1"
+_VERSION = "2.1.1"
 _GH_OWNER_REPO = "miglourenco/ltctolv1"
 _RELEASES_API = f"https://api.github.com/repos/{_GH_OWNER_REPO}/releases/latest"
 _RELEASES_URL = f"https://github.com/{_GH_OWNER_REPO}/releases"
