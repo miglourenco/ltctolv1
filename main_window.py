@@ -47,6 +47,11 @@ from app_controller import (
     EVT_STATUS,
     EVT_TC,
 )
+
+# Remote-mode events come from remote_controller — imported lazily where
+# needed so a host-mode build doesn't require the module to exist.
+EVT_REMOTE_CONNECTED    = "remote_connected"
+EVT_REMOTE_DISCONNECTED = "remote_disconnected"
 from models import (
     CUE_FILE_DESCRIPTION,
     CUE_FILE_EXTENSION,
@@ -329,7 +334,15 @@ class MainWindow:
         self.root = root
         self.ctl = controller
         self.settings = controller.settings
+        self._is_remote = bool(getattr(controller, "is_remote", False))
         self.root.configure(bg=_BG)
+        # In remote mode, advertise the host in the title bar so the
+        # operator can't confuse two LTCtoLV1 windows pointing at
+        # different machines.
+        if self._is_remote:
+            host = getattr(controller, "_host", "")
+            port = getattr(controller, "_port", 0)
+            self.root.title(f"LTC → LV1 — remote: {host}:{port}")
 
         # UI-only state (display widgets, drag state, throttling)
         self._flash_after: Optional[str] = None
@@ -447,6 +460,14 @@ class MainWindow:
             self._set_status_label(payload.get("text", ""), bool(payload.get("warn")))
         elif name == EVT_RECENT:
             self._rebuild_recent_menu()
+        elif name == EVT_REMOTE_CONNECTED:
+            self._set_status_label(
+                f"Remote: connected to {payload.get('host')}:{payload.get('port')}",
+                False,
+            )
+        elif name == EVT_REMOTE_DISCONNECTED:
+            reason = payload.get("reason") or "link lost"
+            self._set_status_label(f"Remote: {reason} (retrying…)", True)
         elif name == EVT_SETTINGS:
             pass  # nothing to refresh — settings widgets are write-through
 
@@ -561,7 +582,10 @@ class MainWindow:
             file_m.add_command(label=f"Associate {CUE_FILE_EXTENSION} files with this app",
                                command=self._associate_file_type)
         file_m.add_separator()
-        file_m.add_command(label="Minimize to tray", command=self._minimize_to_tray)
+        file_m.add_command(label="Switch mode (host / remote)…",
+                           command=self._switch_mode)
+        if not self._is_remote:
+            file_m.add_command(label="Minimize to tray", command=self._minimize_to_tray)
         file_m.add_command(label="Exit", command=self._on_close)
 
         help_m = tk.Menu(menu, tearoff=0)
@@ -1374,10 +1398,26 @@ class MainWindow:
             self._ltc_status.config(text="● No signal", fg=_FG_ERR)
 
     def _render_tc_from_event(self, payload: Dict[str, Any]) -> None:
-        # The poll loop already updated _tc_label/_fps_label for tk efficiency.
-        # This handler exists so web/non-tk subscribers still get a clean event.
-        # We leave the UI labels alone here to avoid double-painting.
-        pass
+        # In host mode the local poll loop owns the TC label (driven by
+        # the queue at 25 Hz, faster than the 10 Hz event throttle), so
+        # this is largely redundant — but it's also harmless. In remote
+        # mode there's no local poll feeding the label, so this handler
+        # IS the only path that paints TC + signal state.
+        if self._ui_hidden:
+            return
+        tc = payload.get("tc")
+        if tc:
+            self._tc_label.config(text=tc)
+            self._last_tc_time = 0
+        fps = payload.get("fps")
+        if fps:
+            self._fps_label.config(
+                text=f"{fps:.2f} fps".rstrip("0").rstrip("."),
+                fg=_FG_HEAD,
+            )
+        sig = payload.get("signal")
+        if sig and self._is_remote:
+            self._render_signal_state(sig)
 
     def _auto_restart(self) -> None:
         if not self.ctl.running:
@@ -1721,6 +1761,32 @@ class MainWindow:
             self.root.destroy()
         except tk.TclError:
             pass
+
+    # === Mode switch ========================================================
+
+    def _switch_mode(self) -> None:
+        """Clear the saved mode and prompt the operator to restart so the
+        first-launch picker can run again. We avoid in-process mode swaps
+        because tearing down a running AppController + audio + LV1 +
+        web server cleanly is fiddly and rarely needed live."""
+        if not self._confirm_discard_changes("Switch mode and restart?"):
+            return
+        ans = messagebox.askyesno(
+            "Switch mode",
+            "Switching between host and remote control requires restarting "
+            "the app so the mode picker can run again.\n\n"
+            "Save settings and exit now?",
+        )
+        if not ans:
+            return
+        try:
+            self.settings.mode = ""
+            self.ctl.save_settings()
+        except Exception:
+            pass
+        # Reuse the normal close path so subscriptions / web server /
+        # tray all tear down cleanly.
+        self._on_close()
 
     # === File type association ==============================================
 

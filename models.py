@@ -290,6 +290,12 @@ class AppSettings:
     # System integration
     tray_enabled: bool = True           # show a system-tray icon
     autostart_enabled: bool = False     # launch on user login (starts minimized to tray)
+    # Operating mode — "host" runs LTC capture + LV1 control + web/tray locally;
+    # "remote" connects to another LTCtoLV1 host on the LAN and acts as a
+    # native remote control. Empty string forces the picker on first launch.
+    mode: str = ""
+    remote_host: str = ""               # last connected remote host (auto-fill)
+    remote_port: int = 8080
 
     @classmethod
     def load(cls) -> "AppSettings":

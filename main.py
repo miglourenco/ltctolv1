@@ -28,19 +28,98 @@ if sys.platform == "win32":
         pass
 
 import tkinter as tk
+from tkinter import messagebox
 
-from app_controller import AppController
 from models import AppSettings
 from main_window import MainWindow
 
 
 def main() -> None:
     settings = AppSettings.load()
-    controller = AppController(settings)
 
-    # --start-minimized is set by the autostart shim. Brings the app up in
-    # the tray with no visible window so it doesn't steal focus on login.
+    # CLI flags trump persisted settings — useful for autostart shims and
+    # for the operator who wants a one-off run in a specific mode.
+    forced_mode = None
+    if "--host" in sys.argv:
+        forced_mode = "host"
+    elif "--remote" in sys.argv:
+        forced_mode = "remote"
     start_minimized = "--start-minimized" in sys.argv
+
+    # Create the tk root up front. We may need it as the parent for the
+    # mode picker / remote host picker BEFORE we have a controller, so it
+    # exists but stays hidden until MainWindow takes over.
+    root = tk.Tk()
+    root.title("LTC → LV1 Snapshot Recall")
+    root.minsize(860, 620)
+    _setup_root_dpi_and_icon(root)
+    root.withdraw()
+
+    # Resolve mode — flag > saved setting > first-launch picker.
+    mode = forced_mode or (settings.mode or "")
+    if mode not in ("host", "remote"):
+        from mode_picker import ModePicker
+        print("[mode] no saved mode — opening picker (host / remote)…")
+        try:
+            root.update_idletasks()
+        except tk.TclError:
+            return
+        picker = ModePicker(root)
+        root.wait_window(picker)
+        mode = picker.result or ""
+        if mode not in ("host", "remote"):
+            print("[mode] cancelled")
+            root.destroy()
+            return
+        settings.mode = mode
+        try:
+            settings.save()
+        except Exception:
+            pass
+        print(f"[mode] selected: {mode}")
+    else:
+        print(f"[mode] using: {mode}")
+
+    # Build the appropriate controller. _start_remote may return None if
+    # the operator cancelled the host picker; in that case we bail
+    # cleanly without leaving an orphan window behind.
+    if mode == "remote":
+        controller = _start_remote(root, settings)
+        if controller is None:
+            root.destroy()
+            return
+    else:
+        controller = _start_host(settings)
+
+    window = MainWindow(root, controller)
+
+    # Host-only integrations (file association, tray, file-arg open).
+    if mode == "host":
+        _register_file_assoc()
+        if getattr(settings, "tray_enabled", True):
+            _start_tray(controller, window)
+        file_arg = _first_existing_file_arg(sys.argv[1:])
+        if file_arg:
+            root.after(100, lambda: window._load_cue_file(file_arg))
+
+    # Reveal the window now that the controller is wired up.
+    root.deiconify()
+
+    if start_minimized and mode == "host":
+        root.after(0, window._minimize_to_tray)
+
+    root.mainloop()
+
+
+# ─── Host mode startup ──────────────────────────────────────────────────
+
+
+def _start_host(settings: AppSettings):
+    """Build a local AppController and bring up the host-side services
+    (web server, LAN announcer). The controller is returned ready to be
+    handed to MainWindow."""
+    from app_controller import AppController
+    controller = AppController(settings)
 
     # Optionally start the built-in web remote. Failures here MUST NOT take
     # down the desktop UI — surface via the status bar and carry on.
@@ -50,66 +129,73 @@ def main() -> None:
             port = int(getattr(settings, "web_port", 8080))
             web = WebServer(controller, host="0.0.0.0", port=port)
             web.start()
-            # Register graceful shutdown so the SSE streams + werkzeug server
-            # exit cleanly when the user closes the app.
             controller.add_shutdown_hook(web.stop)
             controller.set_status(f"Web remote listening on :{port}")
+            # Beacon ourselves on the LAN so other LTCtoLV1 instances in
+            # remote mode can find us without manual IP entry. Only worth
+            # doing when web is up — that's what the remote will connect to.
+            controller.start_lan_announcer()
         except Exception as exc:  # noqa: BLE001
             controller.set_status(f"Web remote disabled: {exc}", warn=True)
 
-    root = tk.Tk()
-    root.title("LTC → LV1 Snapshot Recall")
-    root.minsize(860, 620)
+    return controller
 
-    try:
-        # High-DPI awareness on Windows
-        from ctypes import windll
-        windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
 
-    try:
-        root.iconbitmap(_resource("ltctolv1.ico"))
-    except Exception:
-        pass
+# ─── Remote mode startup ────────────────────────────────────────────────
 
-    # On Windows, force the taskbar icon via Win32 WM_SETICON. tkinter's
-    # iconbitmap only sets the title-bar icon reliably; the taskbar falls
-    # back to the .exe's embedded icon, which Windows aggressively caches —
-    # explicitly pushing the ICO to ICON_SMALL + ICON_BIG bypasses all that.
-    if sys.platform == "win32":
-        _force_windows_icon(root, _resource("ltctolv1.ico"))
 
-    window = MainWindow(root, controller)
+def _start_remote(root: tk.Tk, settings: AppSettings):
+    """Show the host picker, build a RemoteAppController, and connect.
+    Returns the controller on success, or None if the user cancelled."""
+    from remote_controller import RemoteAppController
+    from remote_picker import RemotePicker
 
-    # Register .ltcv1 file association on first frozen launch (Windows only).
-    # Best-effort: silent on failure, since this is a UX nicety, not a hard
-    # requirement. macOS handles association declaratively via Info.plist.
+    while True:
+        print("[remote] opening host picker — scanning LAN for LTCtoLV1 hosts…")
+        # Pump pending tk events so the picker actually gets drawn
+        # immediately (important on Windows where a fresh tk root that
+        # was withdrawn doesn't service its event queue otherwise).
+        try:
+            root.update_idletasks()
+        except tk.TclError:
+            return None
+        picker = RemotePicker(
+            root,
+            default_host=settings.remote_host or "",
+            default_port=int(settings.remote_port or 8080),
+        )
+        root.wait_window(picker)
+        if picker.result is None:
+            print("[remote] picker cancelled — exiting")
+            return None
+        host, port = picker.result
+        print(f"[remote] connecting to {host}:{port}…")
+
+        controller = RemoteAppController(settings, host, port)
+        ok, err = controller.start()
+        if ok:
+            print(f"[remote] connected to {host}:{port}")
+            return controller
+        print(f"[remote] connect failed: {err}")
+        # Connection failed — surface and let the user pick again or quit.
+        messagebox.showerror(
+            "Connect failed",
+            f"Could not reach {host}:{port}\n\n{err or 'Unknown error'}",
+            parent=root,
+        )
+
+
+# ─── Common helpers ─────────────────────────────────────────────────────
+
+
+def _register_file_assoc() -> None:
+    """Best-effort: bind the .ltcv1 extension to this exe (frozen, Windows)."""
     try:
         import file_assoc
         if file_assoc.is_supported() and not file_assoc.is_registered():
             file_assoc.register()
     except Exception:
         pass
-
-    # System tray. The icon stays up for the lifetime of the app so the
-    # operator can always send the UI to the tray (and bring it back).
-    # Failures are non-fatal: the desktop UI still works without a tray.
-    if getattr(settings, "tray_enabled", True):
-        _start_tray(controller, window)
-
-    # If the OS invoked us with a file path (double-click on a .ltcv1 file or
-    # drag-and-drop onto the .exe), open it now that the window is up.
-    file_arg = _first_existing_file_arg(sys.argv[1:])
-    if file_arg:
-        # Defer slightly so the window finishes laying out before we touch it.
-        root.after(100, lambda: window._load_cue_file(file_arg))
-
-    # --start-minimized → withdraw the window before the user sees it.
-    if start_minimized:
-        root.after(0, window._minimize_to_tray)
-
-    root.mainloop()
 
 
 def _first_existing_file_arg(args) -> str:
@@ -121,8 +207,8 @@ def _first_existing_file_arg(args) -> str:
 
 
 def _start_tray(controller, window) -> None:
-    """Wire up the system tray with hooks that marshal back to the tk main
-    thread (pystray callbacks fire on its own message-loop thread)."""
+    """Wire up the system tray. Tray callbacks fire on the pystray thread
+    and marshal back to tk's main loop via root.after_idle."""
     try:
         from tray import TrayApp, default_icon_path
     except Exception as exc:  # noqa: BLE001
@@ -143,8 +229,6 @@ def _start_tray(controller, window) -> None:
         root.after_idle(window._open_web_remote)
 
     def _open_project():
-        # Bring the UI up first so the OS file picker has a parent — picking
-        # against a hidden window misbehaves on macOS in particular.
         def _do():
             window._show_and_focus()
             window._open_list()
@@ -178,8 +262,25 @@ def _start_tray(controller, window) -> None:
         is_web_enabled=_web_on,
     )
     if tray.start():
-        window._tray = tray  # so the MainWindow can update_menu after changes
+        window._tray = tray
         controller.add_shutdown_hook(tray.stop)
+
+
+def _setup_root_dpi_and_icon(root: tk.Tk) -> None:
+    """Apply Windows DPI awareness + load the app icon. Extracted so the
+    mode picker / remote picker that pop before MainWindow inherit the
+    same look-and-feel."""
+    try:
+        from ctypes import windll
+        windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+    try:
+        root.iconbitmap(_resource("ltctolv1.ico"))
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        _force_windows_icon(root, _resource("ltctolv1.ico"))
 
 
 def _force_windows_icon(root, ico_path: str) -> None:
@@ -191,7 +292,6 @@ def _force_windows_icon(root, ico_path: str) -> None:
 
         IMAGE_ICON = 1
         LR_LOADFROMFILE = 0x0010
-        LR_DEFAULTSIZE = 0x0040
         WM_SETICON = 0x0080
         ICON_SMALL = 0
         ICON_BIG = 1
@@ -204,13 +304,11 @@ def _force_windows_icon(root, ico_path: str) -> None:
             return
         hwnd = root.winfo_id()
 
-        # Small (title bar): use system small-icon metric (typically 16x16)
         sm_cx = user32.GetSystemMetrics(49)  # SM_CXSMICON
         sm_cy = user32.GetSystemMetrics(50)  # SM_CYSMICON
         h_small = user32.LoadImageW(
             None, ico_path, IMAGE_ICON, sm_cx, sm_cy, LR_LOADFROMFILE
         )
-        # Big (taskbar / Alt-Tab): use system icon metric (typically 32x32)
         bg_cx = user32.GetSystemMetrics(11)  # SM_CXICON
         bg_cy = user32.GetSystemMetrics(12)  # SM_CYICON
         h_big = user32.LoadImageW(

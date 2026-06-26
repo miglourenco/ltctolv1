@@ -67,6 +67,10 @@ _TC_EVENT_MIN_INTERVAL_S = 0.1
 class AppController:
     """One instance per process. Owns all domain objects and emits events."""
 
+    # True in RemoteAppController; here so MainWindow can probe a single
+    # attribute regardless of which controller it's wired to.
+    is_remote: bool = False
+
     def __init__(self, settings: AppSettings) -> None:
         self.settings = settings
         self._lock = threading.RLock()
@@ -822,6 +826,48 @@ class AppController:
                 self.settings.save()
             except Exception:
                 pass
+
+    # ════════════════════════════════════════════════════════════════════
+    # LAN announcer — beacon ourselves so remote operators can find us
+    # ════════════════════════════════════════════════════════════════════
+
+    def start_lan_announcer(self) -> None:
+        """Begin broadcasting our presence on the LTCtoLV1 multicast group.
+        Should be called only when the web remote is enabled (otherwise
+        there's nothing for a remote operator to talk to)."""
+        if getattr(self, "_announcer", None) is not None:
+            return
+        try:
+            from announce import Announcer, make_uuid
+            from zdns_discover import _local_ipv4s, _rank_ip
+        except Exception:
+            return
+        self._announce_uuid = make_uuid()
+        try:
+            self._announce_hostname = socket.gethostname() or "unknown"
+        except Exception:
+            self._announce_hostname = "unknown"
+
+        def _payload():
+            try:
+                from main_window import _VERSION
+            except Exception:
+                _VERSION = "0.0.0"
+            try:
+                ips = sorted(set(_local_ipv4s()), key=_rank_ip, reverse=True)
+            except Exception:
+                ips = []
+            return {
+                "version": _VERSION,
+                "hostname": self._announce_hostname,
+                "ips": ips,
+                "web_port": int(getattr(self.settings, "web_port", 8080)),
+                "uuid": self._announce_uuid,
+            }
+
+        self._announcer = Announcer(get_payload=_payload)
+        self._announcer.start()
+        self.add_shutdown_hook(self._announcer.stop)
 
     # ════════════════════════════════════════════════════════════════════
     # Shutdown
