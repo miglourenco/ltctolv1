@@ -880,7 +880,12 @@ class AppController:
 
     def shutdown(self) -> None:
         """Wind down the controller: stop audio + LV1 + every shutdown hook
-        (web server, etc). Safe to call more than once."""
+        (web server, etc). Safe to call more than once.
+
+        Uses LV1Client.fast_close() (no reader join) rather than the live-
+        time disconnect() to keep the app-close path snappy. The OS will
+        close the underlying TCP socket on process exit anyway and the
+        reader is a daemon thread, so the 2 s join was pure waiting."""
         if self._is_shutting_down:
             return
         self._is_shutting_down = True
@@ -895,7 +900,7 @@ class AppController:
         except Exception:
             pass
         try:
-            self.lv1.disconnect()
+            self.lv1.fast_close()
         except Exception:
             pass
 

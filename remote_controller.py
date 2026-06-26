@@ -239,6 +239,11 @@ class RemoteAppController:
         return True, None
 
     def shutdown(self) -> None:
+        """Best-effort fast teardown: stop the SSE reader, close the
+        long-lived HTTP response, and briefly wait for the reader thread
+        to exit. The reader is a daemon thread so even if it overruns the
+        join, the process exit will reap it — but a short join lets us
+        flush any in-flight subscriber callbacks cleanly."""
         if self._is_shutting_down:
             return
         self._is_shutting_down = True
@@ -249,10 +254,13 @@ class RemoteAppController:
                 pass
         self._sse_stop.set()
         try:
-            if self._sse_resp:
+            if self._sse_resp is not None:
                 self._sse_resp.close()
+                self._sse_resp = None
         except Exception:
             pass
+        if self._sse_thread and self._sse_thread.is_alive():
+            self._sse_thread.join(timeout=0.5)
 
     def add_shutdown_hook(self, fn: Callable[[], None]) -> None:
         self._shutdown_hooks.append(fn)
@@ -598,12 +606,22 @@ class RemoteAppController:
             return False, str(exc), False
 
     def save_cue_file(self, path: Optional[str] = None) -> Tuple[bool, Optional[str]]:
-        """In remote mode `path` is treated as a basename only; the host
-        decides where to put it (default projects folder). Passing None
-        re-saves to the host's current_file."""
+        """Mirror the web's Save semantics:
+
+        - `path is None` or `path == self.current_file` → plain "Save",
+          host re-saves at its current_file with no body. This is the
+          right behaviour when the operator clicked File ▸ Save on a
+          file that the host already owns.
+        - Otherwise `path` is taken as a *name only* (basename) and the
+          host writes it into its default projects folder. This is what
+          File ▸ Save as… should pass in remote mode — full filesystem
+          paths from the operator's machine are meaningless on the host.
+        """
         body: Dict[str, Any] = {}
-        if path:
-            body["name"] = os.path.basename(path)
+        if path and path != self.current_file:
+            name = os.path.basename(path).strip()
+            if name:
+                body["name"] = name
         try:
             r = self._post("/api/cues/save", body)
             return bool(r.get("ok")), r.get("error")
@@ -813,6 +831,7 @@ class RemoteAppController:
         if name == EVT_DISCOVERY:
             with self._lock:
                 self.discovery_running = bool(payload.get("scanning"))
+                self.discovered = self._build_discovery_entries(payload.get("results") or [])
             self._emit(EVT_DISCOVERY, payload)
             return
         if name == EVT_STATUS:
@@ -830,6 +849,25 @@ class RemoteAppController:
             return
         # Unknown events: forward verbatim, harmless.
         self._emit(name, payload)
+
+    @staticmethod
+    def _build_discovery_entries(rows: List[Dict[str, Any]]):
+        """Convert the simplified snapshot/event form ([{host, ip, port}, ...])
+        back into DiscoveryEntry-like objects so MainWindow's _resolve_target
+        can iterate .addresses / .host / .port the same way as in host mode."""
+        from zdns_discover import DiscoveryEntry
+        entries: List[DiscoveryEntry] = []
+        for r in rows:
+            ip = str(r.get("ip") or "")
+            entries.append(DiscoveryEntry(
+                service="",
+                uuid=None,
+                host=str(r.get("host") or ""),
+                port=int(r.get("port") or 0),
+                addresses=[ip] if ip else [],
+                source=ip,
+            ))
+        return entries
 
     def _apply_snapshot(self, snap: Dict[str, Any]) -> None:
         """Hydrate every mirrored field from a /api/state response or the
@@ -859,6 +897,7 @@ class RemoteAppController:
             self.last_status = snap.get("last_status")
             disc = snap.get("discovery") or {}
             self.discovery_running = bool(disc.get("scanning"))
+            self.discovered = self._build_discovery_entries(disc.get("results") or [])
         # Fire individual events so subscribers see initial state painted.
         self._emit(EVT_CUES, {"cues": snap.get("cues") or []})
         self._emit(EVT_LV1_CATALOG, {"scenes": snap.get("scenes") or []})

@@ -117,7 +117,27 @@ class LV1Client:
 
     def connect(self, host: str, port: int) -> None:
         """Start connecting (returns immediately). Use connection_state()
-        or the on_connection_change callback to know when it's up."""
+        or the on_connection_change callback to know when it's up.
+
+        Idempotent: if we're already connected to the exact same target,
+        we re-emit the current state and return. This matters for the
+        web/remote-mode flow where the operator clicks Connect on an
+        already-connected target — without this check the call would
+        tear down a healthy LV1 session and reopen it, which on Windows
+        adds a multi-second freeze waiting on the reader's join."""
+        with self._state_lock:
+            same_target = (
+                self._connected
+                and self._host == host
+                and self._port == port
+            )
+        if same_target:
+            # Re-broadcast the current state so any UI that just issued
+            # the connect (and is sitting at "● connecting…") snaps back
+            # to ONLINE without having to wait for the next genuine
+            # state transition.
+            self._emit_connection_state()
+            return
         self.disconnect()
         self._host = host
         self._port = port
@@ -131,7 +151,10 @@ class LV1Client:
         self._reader.start()
 
     def disconnect(self) -> None:
-        """Stop the reader thread and close the socket."""
+        """Stop the reader thread and close the socket. Waits up to 2 s
+        for the reader to exit cleanly so any in-flight callbacks settle
+        before the caller assumes we're fully torn down. Use fast_close()
+        instead during app shutdown."""
         self._stop.set()
         self._close_socket()
         if self._reader and self._reader.is_alive():
@@ -141,6 +164,16 @@ class LV1Client:
             self._connected = False
             self._registered = False
         self._emit_connection_state()
+
+    def fast_close(self) -> None:
+        """Stop the reader + close the socket, but don't wait for the
+        reader thread to exit. Intended for app shutdown only — the
+        reader is a daemon thread that will die with the process, and
+        the up-to-2-second join() in disconnect() feels like a freeze
+        on a clean app close even though no real work is happening."""
+        self.auto_reconnect = False
+        self._stop.set()
+        self._close_socket()
 
     def is_connected(self) -> bool:
         with self._state_lock:
@@ -301,6 +334,17 @@ class LV1Client:
             try:
                 chunk = sock.recv(65536)
             except OSError as exc:
+                # Windows-only race: when close() lands before the
+                # in-flight recv() wakes up via shutdown(), recv raises
+                # WSAENOTSOCK (10038). Same goes for WSAENOTCONN (10057)
+                # if the peer closed the half-duplex first. These are
+                # teardown noise, not connection problems — return so the
+                # outer reader exits cleanly without logging a cryptic
+                # Win32 error to the status bar. Auto-reconnect (if on)
+                # will pick the LV1 back up if the peer is still alive.
+                win = getattr(exc, "winerror", None)
+                if win in (10038, 10057):
+                    return
                 raise RuntimeError(f"recv failed: {exc}")
             if not chunk:
                 raise RuntimeError("LV1 closed the connection")

@@ -22,7 +22,7 @@ import threading
 import tkinter as tk
 import urllib.request
 import webbrowser
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any, Dict, List, Optional
 
 try:
@@ -576,6 +576,11 @@ class MainWindow:
         file_m.add_separator()
         file_m.add_command(label="Save", command=self._save_list)
         file_m.add_command(label="Save as…", command=self._save_list_as)
+        if self._is_remote:
+            # Mirrors the web's Download button — pulls the host's
+            # current cue list down to the operator's local disk.
+            file_m.add_command(label="Download to this PC…",
+                               command=self._download_remote_cues)
         file_m.add_separator()
         file_m.add_command(label="Web remote settings…", command=self._show_web_settings)
         if sys.platform == "win32":
@@ -1537,6 +1542,22 @@ class MainWindow:
             self._save_list_as()
 
     def _save_list_as(self) -> None:
+        # In remote mode the file lives on the HOST, so opening a local
+        # filedialog is misleading — the operator would pick a path on
+        # their own machine while the file actually lands on the host's
+        # default projects folder. Match the web's "name only" prompt.
+        if self._is_remote:
+            name = simpledialog.askstring(
+                "Save as",
+                "File name (saved to the host's LTCtoLV1 projects folder):",
+                parent=self.root,
+            )
+            if not name or not name.strip():
+                return
+            ok, err = self.ctl.save_cue_file(name.strip())
+            if not ok:
+                messagebox.showerror("Save", f"Failed to save:\n{err}")
+            return
         path = filedialog.asksaveasfilename(
             title="Save cue list",
             initialdir=self._dialog_initial_dir(),
@@ -1548,6 +1569,38 @@ class MainWindow:
         )
         if path:
             self._write_cue_file(path)
+
+    def _download_remote_cues(self) -> None:
+        """Mirror the web's Download button — GET /api/cues/download on
+        the host and write the JSON to a file the operator picks."""
+        if not self._is_remote:
+            return
+        import urllib.request
+        # Suggested filename: whatever the host has currently open.
+        suggested = (
+            os.path.basename(self.ctl.current_file)
+            if self.ctl.current_file else "cues" + CUE_FILE_EXTENSION
+        )
+        path = filedialog.asksaveasfilename(
+            title="Download cue list to this PC",
+            initialfile=suggested,
+            defaultextension=CUE_FILE_EXTENSION,
+            filetypes=[
+                (CUE_FILE_DESCRIPTION, f"*{CUE_FILE_EXTENSION}"),
+                ("JSON cue lists (legacy)", "*.json"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            base = getattr(self.ctl, "_base", "")
+            with urllib.request.urlopen(f"{base}/api/cues/download", timeout=10) as resp:
+                data = resp.read()
+            with open(path, "wb") as fh:
+                fh.write(data)
+            self.ctl.set_status(f"Downloaded: {os.path.basename(path)}")
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Download", f"Failed:\n{exc}")
 
     def _write_cue_file(self, path: str) -> None:
         ok, err = self.ctl.save_cue_file(path)

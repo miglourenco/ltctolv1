@@ -111,7 +111,9 @@ class Announcer:
         # crash the host app — just silently disables discovery.
         sock = self._open_socket()
         if sock is None:
+            print("[announce] failed to open multicast socket")
             return
+        first = True
         try:
             while not self._stop.is_set():
                 try:
@@ -119,10 +121,16 @@ class Announcer:
                     payload.setdefault("app", APP_TAG)
                     data = json.dumps(payload).encode("utf-8")
                     sock.sendto(data, (MCAST_ADDR, MCAST_PORT))
+                    if first:
+                        print(f"[announce] beaconing on {MCAST_ADDR}:{MCAST_PORT} "
+                              f"(host={payload.get('hostname')!r}, "
+                              f"ips={payload.get('ips')}, "
+                              f"port={payload.get('web_port')})")
+                        first = False
                 except Exception as exc:  # noqa: BLE001
-                    # Don't spam stdout — multicast send can flap if a NIC
-                    # is renamed mid-run. Just back off the next beacon.
-                    pass
+                    if first:
+                        print(f"[announce] beacon send failed: {exc}")
+                        first = False
                 # wait() returns True if stop was set during the sleep, so
                 # we exit immediately on shutdown instead of dragging out.
                 if self._stop.wait(self._interval):
@@ -137,6 +145,14 @@ class Announcer:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
+            # Explicit loopback — needed when host + remote run on the
+            # same machine. Default is usually ON but some Windows builds
+            # ship with it OFF (and quietly so), which makes same-host
+            # testing fail silently.
+            try:
+                s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+            except OSError:
+                pass
             return s
         except OSError:
             return None
@@ -185,7 +201,11 @@ class Discoverer:
     def _run(self) -> None:
         sock = self._open_socket()
         if sock is None:
+            print("[discover] failed to open multicast listen socket on "
+                  f"{MCAST_ADDR}:{MCAST_PORT} (firewall? port in use?)")
             return
+        print(f"[discover] listening on {MCAST_ADDR}:{MCAST_PORT}")
+        first_packet = True
         try:
             while not self._stop.is_set():
                 try:
@@ -196,6 +216,10 @@ class Discoverer:
                     continue
                 except OSError:
                     break
+                if first_packet:
+                    print(f"[discover] first packet from {addr[0]}:{addr[1]} "
+                          f"({len(data)} bytes)")
+                    first_packet = False
                 self._handle_packet(data, addr[0])
         finally:
             try:
