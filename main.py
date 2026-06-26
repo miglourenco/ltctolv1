@@ -45,6 +45,20 @@ def main() -> None:
     elif "--remote" in sys.argv:
         forced_mode = "remote"
     start_minimized = "--start-minimized" in sys.argv
+    allow_multiple = "--allow-multiple" in sys.argv
+
+    # Single-instance enforcement. If another LTCtoLV1 is already running
+    # on this PC, signal it to bring its window forward and exit. The
+    # --allow-multiple escape hatch is for the dev workflow where the
+    # same machine runs a host AND a remote instance side by side.
+    instance = None
+    if not allow_multiple:
+        from single_instance import SingleInstance
+        instance = SingleInstance()
+        if not instance.acquire():
+            print("[instance] LTCtoLV1 is already running — bringing existing window to front and exiting")
+            instance.signal_primary()
+            return
 
     # Create the tk root up front. We may need it as the parent for the
     # mode picker / remote host picker BEFORE we have a controller, so it
@@ -63,6 +77,7 @@ def main() -> None:
         try:
             root.update_idletasks()
         except tk.TclError:
+            _release_instance(instance)
             return
         picker = ModePicker(root)
         root.wait_window(picker)
@@ -70,6 +85,7 @@ def main() -> None:
         if mode not in ("host", "remote"):
             print("[mode] cancelled")
             root.destroy()
+            _release_instance(instance)
             return
         settings.mode = mode
         try:
@@ -87,11 +103,20 @@ def main() -> None:
         controller = _start_remote(root, settings)
         if controller is None:
             root.destroy()
+            _release_instance(instance)
             return
     else:
         controller = _start_host(settings)
 
     window = MainWindow(root, controller)
+
+    # Wire the single-instance signal into the window's "show + focus"
+    # path so a second launch raises this one instead of starting fresh.
+    if instance is not None:
+        instance.set_on_signal(
+            lambda: root.after_idle(window._show_and_focus)
+        )
+        controller.add_shutdown_hook(instance.release)
 
     # Host-only integrations (file association, tray, file-arg open).
     if mode == "host":
@@ -204,6 +229,17 @@ def _first_existing_file_arg(args) -> str:
         if a and not a.startswith("-") and os.path.isfile(a):
             return a
     return ""
+
+
+def _release_instance(instance) -> None:
+    """Best-effort release of the single-instance lock for the aborted
+    startup paths (mode picker cancelled, remote host picker cancelled)."""
+    if instance is None:
+        return
+    try:
+        instance.release()
+    except Exception:
+        pass
 
 
 def _start_tray(controller, window) -> None:
