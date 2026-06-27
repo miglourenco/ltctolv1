@@ -219,10 +219,12 @@ class LV1Client:
 
     def _run_reader(self) -> None:
         backoff = self.reconnect_min_s
+        last_error_logged: Optional[str] = None
         while not self._stop.is_set():
             try:
                 self._connect_socket()
                 backoff = self.reconnect_min_s
+                last_error_logged = None  # back online — next failure is news again
                 self._handshake()
                 self._read_loop()
             except Exception as exc:  # noqa: BLE001
@@ -230,8 +232,18 @@ class LV1Client:
                 # as a connection failure. Socket-gone errors after _stop
                 # is set are just shutdown noise.
                 if not self._stop.is_set():
-                    self._set_error(str(exc))
-                    self._log("warn", f"LV1 connection failed: {exc}")
+                    msg = str(exc)
+                    self._set_error(msg)
+                    # Auto-reconnect re-enters this loop every few seconds
+                    # whenever the LV1 is unreachable. We log the FIRST
+                    # failure so the operator notices, then stay quiet on
+                    # identical retries — the LV1 STATUS panel already
+                    # shows "Disconnected — ..." so the operator can see
+                    # the persistent state without it bouncing in/out of
+                    # the status bar.
+                    if msg != last_error_logged:
+                        self._log("warn", f"LV1 connection failed: {exc}")
+                        last_error_logged = msg
             finally:
                 self._close_socket()
                 with self._state_lock:

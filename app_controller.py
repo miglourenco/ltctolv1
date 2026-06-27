@@ -848,19 +848,35 @@ class AppController:
         except Exception:
             self._announce_hostname = "unknown"
 
+        # Cache the IP enumeration. _local_ipv4s() shells out to ipconfig
+        # on Windows, which is expensive (and used to flash a console
+        # window every 2 s before we added CREATE_NO_WINDOW). Local IPs
+        # rarely change mid-session — refresh once a minute is plenty.
+        self._announce_ips_cache: List[str] = []
+        self._announce_ips_cache_at: float = 0.0
+        _IP_CACHE_TTL_S = 60.0
+
+        def _get_ips() -> List[str]:
+            now = time.monotonic()
+            if (now - self._announce_ips_cache_at) < _IP_CACHE_TTL_S and self._announce_ips_cache:
+                return self._announce_ips_cache
+            try:
+                fresh = sorted(set(_local_ipv4s()), key=_rank_ip, reverse=True)
+            except Exception:
+                fresh = []
+            self._announce_ips_cache = fresh
+            self._announce_ips_cache_at = now
+            return fresh
+
         def _payload():
             try:
                 from main_window import _VERSION
             except Exception:
                 _VERSION = "0.0.0"
-            try:
-                ips = sorted(set(_local_ipv4s()), key=_rank_ip, reverse=True)
-            except Exception:
-                ips = []
             return {
                 "version": _VERSION,
                 "hostname": self._announce_hostname,
-                "ips": ips,
+                "ips": _get_ips(),
                 "web_port": int(getattr(self.settings, "web_port", 8080)),
                 "uuid": self._announce_uuid,
             }

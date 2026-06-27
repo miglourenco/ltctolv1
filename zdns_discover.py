@@ -259,6 +259,12 @@ def _local_ipv4s() -> List[str]:
 
     # 5: Platform-specific subprocess fallback
     import subprocess
+    # On Windows the parent (PyInstaller --windowed app or pythonw.exe)
+    # has no console attached. Without CREATE_NO_WINDOW the ipconfig
+    # child spawns its OWN black cmd window for the lifetime of the
+    # call — visible as a flashing black square if we call this on a
+    # timer. The flag tells Windows to start the child detached, no UI.
+    _NO_WIN = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     if sys.platform == "win32":
         # ipconfig output contains the local IPv4 AND the subnet mask, default
         # gateway, DHCP server, DNS servers — ALL in the same "label : value"
@@ -279,6 +285,7 @@ def _local_ipv4s() -> List[str]:
                 capture_output=True,
                 text=True,
                 timeout=3.0,
+                creationflags=_NO_WIN,
             )
             for line in res.stdout.splitlines():
                 if ":" not in line:
